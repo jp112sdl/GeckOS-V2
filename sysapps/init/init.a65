@@ -43,6 +43,11 @@
  * its output when it has started everything - three when something could
  * not be started.
  *
+ * If INIT_CLOCK is defined (with INIT_VERBOSE), init shows the time after
+ * its first line, as YYYY-MM-DD HH:MM:SS. The ROM needs a clock driver
+ * for it: clk_get, c=0 when clk_bcd holds seconds, minutes, hours,
+ * weekday, day, month and year, BCD, the year from 2000.
+ *
  * If INIT_LIB6502 is defined, then PK_LIB ROM entries are supported and
  * started with the lib6502 forkto call - or at least with an undocumented
  * derivate... (argh, horrible code...).
@@ -181,6 +186,25 @@ main	  .(
 no_out
 	ldx #0
 	jsr itout
+#ifdef INIT_CLOCK
+	.(
+	jsr clk_get		; the registers of the clock, BCD, in clk_bcd
+	bcs none
+	lda #$20		; the century
+	jsr hexout
+	ldx #6			; year down to seconds
+l	cpx #3			; not the weekday
+	beq n
+	lda clk_bcd,x
+	jsr hexout
+	lda clksep,x
+	jsr chrout
+n	dex
+	bpl l
+	lda #10
+	jsr chrout
+none	.)
+#endif
 #endif
 #ifdef INIT_RESTART
 	lda #<sigaddr
@@ -555,6 +579,10 @@ m3	.asc 34,":",0
 m4	.asc " failed!",13,10,0
 m5	.asc " ok!",13,10,0
 m6	.asc "Couldn't alloc streams!",13,10,0
+#ifdef INIT_CLOCK
+	/* behind the registers of clk_bcd, from seconds to year */
+&clksep	.byt 13, ":", ":", 0, " ", "-", "-"
+#endif
 #ifdef INIT_RESTART
 m7	.asc 13,10, "Received sigchld from ",0
 m8 	=m7-3	; CRLF
