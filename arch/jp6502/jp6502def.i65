@@ -30,7 +30,7 @@
  *				SD card, bit-banged SPI (port B)
  *	$8400		R6551 ACIA, USB serial through an FT232R
  *	$8800		VIA2	SN76489 sound (port A, PB0-PB2), LED (PB7),
- *				D-pad (PB3-PB6)
+ *				D-pad (PB3-PB6), speaker switch (CB2)
  *	$9000		VIA1	HD44780 LCD, 20x4, 8 bit (port B data,
  *				PA7=E, PA6=RW, PA5=RS)
  *	$a000-$ffff	24k ROM
@@ -57,6 +57,15 @@
 #define	SN_WE		%00000010
 #define	SN_CE		%00000100
 #define	LED_BIT		%10000000
+
+/*
+ * VIA2 CB2 is the gate of a MOSFET in series with the speaker, pulled
+ * down: after a reset CB2 is an input and the speaker is off, so the
+ * tone the SN76489 comes up with is not heard. Once the chip is quiet,
+ * CB2 becomes a manual output, high - bits 7-5 of the PCR.
+ */
+#define	PCR_CB2		%11100000
+#define	PCR_CB2_HIGH	%11100000
 
 /*
  * The beeps of the SN76489. The chip runs on the same oscillator as the

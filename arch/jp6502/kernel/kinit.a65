@@ -82,6 +82,14 @@ sndone
 	  .)
 
 /*
+ * The chip is quiet, the speaker can go on (see jp6502def.i65).
+ */
+	  lda VIA2+VIA_PCR
+	  and #255-PCR_CB2
+	  ora #PCR_CB2_HIGH
+	  sta VIA2+VIA_PCR
+
+/*
  * A short beep: the board is starting. The one at the end of the boot
  * comes from init, through the console.
  */

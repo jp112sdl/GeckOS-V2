@@ -45,7 +45,7 @@
  *   screen                print the VDP text screen
  *   lcd                   print the LCD
  *   led                   print the LED state
- *   sound                 print the SN76489 volumes
+ *   sound                 print the SN76489 volumes and the speaker
  *   regs                  print the CPU registers
  *   ilreset               restart the -I measurement and the overrun count
  *   jump ADDR [X]         continue at ADDR (hex), interrupts off, XR set
@@ -676,7 +676,7 @@ static u8 via3_read_pb(via_t *v)
 
 /* ------------------------------------------------------------------ */
 /* VIA2: SN76489 - data on port A, READY PB0, /WE PB1, /CE PB2;        */
-/* D-pad on PB3-PB6, not pressed                                       */
+/* D-pad on PB3-PB6, not pressed; CB2 switches the speaker             */
 
 static struct {
 	u8 vol[4];		/* 0 loudest, 15 off */
@@ -688,7 +688,32 @@ static struct {
 	int nbeep;		/* tones on channel 0: start, end, divider */
 	u64 beep_on[64], beep_off[64];
 	u16 beep_div[64];
+	u8 beep_heard[64];	/* the speaker was on */
+	int spk;		/* speaker on */
+	u64 spk_at;		/* when it went on last */
+	int spk_loud;		/* channels that sounded then */
 } sn;
+
+/* The speaker is in series with a MOSFET whose gate is CB2, pulled
+   down: it is on only while CB2 is a manual output driven high, PCR
+   bits 7-5 = 111. Until then the tone the chip comes up with is not
+   heard - the chip starts with every volume at 0 here, the loudest. */
+static int speaker_on(void)
+{
+	return (via2.pcr & 0xe0) == 0xe0;
+}
+
+static void via2_write_pcr(void)
+{
+	int on = speaker_on();
+	if (on && !sn.spk) {
+		sn.spk_at = cycles;
+		sn.spk_loud = 0;
+		for (int i = 0; i < 4; i++)
+			if (sn.vol[i] != 15) sn.spk_loud++;
+	}
+	sn.spk = on;
+}
 
 static void sn_byte(u8 b)
 {
@@ -706,6 +731,7 @@ static void sn_byte(u8 b)
 		sn.beep_on[sn.nbeep] = cycles;
 		sn.beep_div[sn.nbeep] = sn.tone[0];
 		sn.beep_off[sn.nbeep] = 0;
+		sn.beep_heard[sn.nbeep] = speaker_on();
 		sn.nbeep++;
 	}
 	if (old0 != 15 && sn.vol[0] == 15 && sn.nbeep)
@@ -740,12 +766,18 @@ static void sn_print(FILE *f)
 	fprintf(f, "SN76489 volume (15 = off): %d %d %d noise %d, %ld writes, "
 		"%ld data changes while busy\n",
 		sn.vol[0], sn.vol[1], sn.vol[2], sn.vol[3], sn.writes, sn.early);
+	fprintf(f, "speaker %s", speaker_on() ? "on" : "off");
+	if (sn.spk_at)
+		fprintf(f, ", switched on at %.3fs with %d channels sounding",
+			sn.spk_at / (clock_mhz * 1e6), sn.spk_loud);
+	fprintf(f, "\n");
 	/* the chip runs on the CPU oscillator */
 	for (int i = 0; i < sn.nbeep; i++)
-		fprintf(f, "  beep at %.3fs, %.0f ms, %.0f Hz\n",
+		fprintf(f, "  beep at %.3fs, %.0f ms, %.0f Hz%s\n",
 			sn.beep_on[i] / (clock_mhz * 1e6),
 			sn.beep_off[i] ? (sn.beep_off[i] - sn.beep_on[i]) / (clock_mhz * 1e3) : -1.0,
-			sn.beep_div[i] ? clock_mhz * 1e6 / (32.0 * sn.beep_div[i]) : 0);
+			sn.beep_div[i] ? clock_mhz * 1e6 / (32.0 * sn.beep_div[i]) : 0,
+			sn.beep_heard[i] ? "" : ", speaker off");
 }
 
 /* ------------------------------------------------------------------ */
@@ -823,6 +855,7 @@ static void io_write(u16 a, u8 d)
 	if (a >= 0x8800 && a < 0x9000) {
 		if ((a & 15) == 1 || (a & 15) == 15) via2_write_pa();
 		via_write(&via2, a & 15, d);
+		if ((a & 15) == 12) via2_write_pcr();
 		led_state = ((via2.orb & via2.ddrb) & 0x80) != 0;
 		return;
 	}
@@ -1216,6 +1249,7 @@ static void reset(void)
 	via2.read_pb = via2_read_pb;
 	via2.write_pb = via2_write_pb;
 	sn.lastpb = 0xff;
+	sn.spk = 0;
 	via1.read_pb = via1_read_pb;
 	sd.lastpb = 0xff; sd.miso = 1;
 	acia_reset();
