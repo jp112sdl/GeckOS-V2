@@ -5,6 +5,8 @@
 #   make CLOCK=2	for another CPU clock (1, 2, 4 or 8 MHz; default 4)
 #   make SHELLS=-DNO_SERIAL_SHELL	only the shell on the VDP console
 #   make SHELLS=-DNO_VIDEO_SHELL	only the shell on the serial line
+#   make FG=1 BG=15	colours of the text screen (TMS9918 numbers,
+#			jp6502def.i65; default 15 on 4, white on dark blue)
 #   make sdcard		boot/sdcard/: the programs to copy onto the SD card
 #   make sdimg		boot/sd.img: a card image with them, for the emulator
 #   make run		the ROM in the emulator, serial line on this terminal
@@ -15,6 +17,8 @@
 
 CLOCK=4
 SHELLS=
+FG=15
+BG=4
 
 XA=xa -k -XMASM
 FILE=file65
@@ -49,6 +53,7 @@ all: $(TRG)
 
 $(TRG):
 	$(XA) -R -I../../include -I. -I../.. -DCLOCK_MHZ=$(CLOCK) $(SHELLS) \
+		-DVDP_FG=$(FG) -DVDP_BG=$(BG) \
 		-bt $(ROMSTART) -bd $(DATASTART) -bz 8 -bb 16384 \
 		rom.a65 -o rom.o65 -l rom.lab
 	$(FILE) rom.o65

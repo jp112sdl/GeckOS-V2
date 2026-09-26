@@ -503,8 +503,9 @@ static void vdp_screen(FILE *f)
 	int text = (vdp.reg[1] & 0x18) == 0x10;
 	int cols = text ? 40 : 32;
 	u16 nt = (vdp.reg[2] & 0x0f) * 0x400;
-	fprintf(f, "+----------------------------------------+ VDP %s%s\n",
-		text ? "text" : "graphics", (vdp.reg[1] & 0x40) ? "" : " (blank)");
+	fprintf(f, "+----------------------------------------+ VDP %s%s, colours %d on %d\n",
+		text ? "text" : "graphics", (vdp.reg[1] & 0x40) ? "" : " (blank)",
+		vdp.reg[7] >> 4, vdp.reg[7] & 15);
 	for (int r = 0; r < 24; r++) {
 		fputc('|', f);
 		for (int c = 0; c < cols; c++) {

@@ -242,7 +242,7 @@ regtab	.byt $00		; no mode 3, no external video
 	.byt $00		; colour table, unused in text mode
 	.byt VDP_PATTAB >> 11
 	.byt $00, $00		; sprites, unused in text mode
-	.byt $f4		; white on dark blue
+	.byt (VDP_FG & 15) << 4 | (VDP_BG & 15)	; text, backdrop
 
 	/* copy 96 characters from (vp), eor with yr */
 fontcopy

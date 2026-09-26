@@ -48,6 +48,20 @@
 #define	VDP_VRAM	$8080
 #define	VDP_REG		$8081
 
+/*
+ * Colours of the text screen, TMS9918 colour numbers: 1 black, 2 medium
+ * green, 3 light green, 4 dark blue, 5 light blue, 6 dark red, 7 cyan,
+ * 8 medium red, 9 light red, 10 dark yellow, 11 light yellow, 12 dark
+ * green, 13 magenta, 14 grey, 15 white. The Makefile passes them in
+ * (make FG=.. BG=..).
+ */
+#ifndef VDP_FG
+#define	VDP_FG		15
+#endif
+#ifndef VDP_BG
+#define	VDP_BG		4
+#endif
+
 #define	VIA3		$8200
 #define	ACIABASE	$8400
 #define	VIA2		$8800

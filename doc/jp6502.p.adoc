@@ -73,6 +73,14 @@ SHELLS::
 	*-DNO_VIDEO_SHELL* leaves one of them out, which leaves about 6k
 	more RAM for programs.
 
+FG, BG::
+	the colours of the text screen, TMS9918 colour numbers:
+	*make FG=1 BG=15* is black on white. The default is 15 on 4,
+	white on dark blue. 1 black, 2 medium green, 3 light green,
+	4 dark blue, 5 light blue, 6 dark red, 7 cyan, 8 medium red,
+	9 light red, 10 dark yellow, 11 light yellow, 12 dark green,
+	13 magenta, 14 grey, 15 white; 0 (transparent) shows black.
+
 In *rom.a65*, BOOTDRV and ROOTPATH give where the shell is loaded from
 and where it starts ("b:").
 
@@ -106,7 +114,8 @@ system resets.
 
 === CONSOLES
 The VDP shows two virtual consoles in 40x24 text mode, white on dark
-blue, with the character set of the board's firmware. Page Up switches
+blue unless built otherwise (FG, BG), with the character set of the
+board's firmware. Page Up switches
 between them. The screen is kept in RAM and copied to the VDP when it
 changed, at every system tick; the VDP gets 8 us between two accesses,
 as the board's firmware does.
