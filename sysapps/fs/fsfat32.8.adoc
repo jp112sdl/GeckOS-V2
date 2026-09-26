@@ -44,8 +44,9 @@ The free space in the directory listing comes from the FSInfo sector.
 It is kept up to date when fsfat32 writes; when the FSInfo sector does
 not know it, the free space is not listed.
 
-There is no clock; created and written files get the date and time
-FSFAT32_DATE and FSFAT32_TIME.
+Created and written files get the time of the clock driver, when the
+ROM has one (FSFAT32_CLOCK); without one, or when it has no time,
+the date and time FSFAT32_DATE and FSFAT32_TIME.
 
 The medium can be changed while no file is open: every request that
 finds no file open reads the boot sector again, and mounts the medium
@@ -74,8 +75,14 @@ FSFAT32_DEVICE::
 FSFAT32_MAXFILE::
 	number of files that can be open at the same time, 4 if not set;
 	each one takes 512 bytes of buffer
+FSFAT32_CLOCK::
+	defined when the ROM has a clock driver. It provides *clk_get*,
+	which puts the time and date (two bytes each, FAT encoding, low
+	bytes first) into *clk_now* and returns c=0, or c=1 when it has
+	no time
 FSFAT32_DATE, FSFAT32_TIME::
-	date and time for written files, in FAT encoding
+	date and time for written files, in FAT encoding, when there is
+	no clock
 
 == SEE ALSO
 link:../../doc/jp6502.p.adoc[jp6502(p)],

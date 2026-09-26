@@ -48,7 +48,13 @@
  * that finds nothing open, the boot sector is read again and its serial
  * number compared.
  *
- * There is no clock, so new and written files get FSFAT32_DATE and
+ * New and written files get the time from a clock driver elsewhere in
+ * the ROM, when FSFAT32_CLOCK is defined. It provides
+ *
+ *	clk_get		c=0: clk_now holds the time (2 bytes) and the date
+ *			(2 bytes), FAT encoding, low bytes first
+ *
+ * Without one, or when it has no time, they get FSFAT32_DATE and
  * FSFAT32_TIME (FAT encoding).
  */
 
@@ -188,6 +194,9 @@ ftmp2	.dsb 4
 o_lba	.dsb 4
 wlba	.dsb 4
 r32c	.byt 0
+#ifndef FSFAT32_CLOCK
+clk_now	.dsb 4		/* the time for stamp, see there */
+#endif
 	.text
 
 #include FSFAT32_DEVICE
@@ -1961,29 +1970,31 @@ setclus	.(
 
 	/* creation, write and access date of the entry at ep */
 stamp	.(
-	ldy #$0e
+#ifdef FSFAT32_CLOCK
+	jsr clk_get
+	bcc have
+#endif
+	ldx #3
+f	lda fixed,x
+	sta clk_now,x
+	dex
+	bpl f
+have	ldy #$0e
 	jsr one
 	ldy #$16
 	jsr one
-	ldy #$12
-	lda #<FSFAT32_DATE
+	ldy #$12		; access: the date only
+	ldx #2
+	.byt $2c
+one	ldx #0
+l	lda clk_now,x
 	sta (ep),y
 	iny
-	lda #>FSFAT32_DATE
-	sta (ep),y
+	inx
+	cpx #4
+	bcc l
 	rts
-one	lda #<FSFAT32_TIME
-	sta (ep),y
-	iny
-	lda #>FSFAT32_TIME
-	sta (ep),y
-	iny
-	lda #<FSFAT32_DATE
-	sta (ep),y
-	iny
-	lda #>FSFAT32_DATE
-	sta (ep),y
-	rts
+fixed	.word FSFAT32_TIME, FSFAT32_DATE
 	.)
 
 /*
