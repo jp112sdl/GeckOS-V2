@@ -86,7 +86,7 @@ sndone
  */
 	  lda VIA2+VIA_PCR
 	  and #255-PCR_CB2
-	  ora #PCR_CB2_HIGH
+	  ora #PCR_CB2_LOW
 	  sta VIA2+VIA_PCR
 
 /*

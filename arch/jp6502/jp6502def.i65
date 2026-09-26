@@ -59,13 +59,16 @@
 #define	LED_BIT		%10000000
 
 /*
- * VIA2 CB2 is the gate of a MOSFET in series with the speaker, pulled
- * down: after a reset CB2 is an input and the speaker is off, so the
- * tone the SN76489 comes up with is not heard. Once the chip is quiet,
- * CB2 becomes a manual output, high - bits 7-5 of the PCR.
+ * The speaker is switched by a MOSFET in series with it, and VIA2 CB2
+ * drives that one through a second MOSFET as an inverter: CB2 high or
+ * not driven is off, low is on. After a reset CB2 is an input, pulled
+ * up - inside a 6522 other than the W65C22S, by a resistor on the
+ * board otherwise - so the tone the SN76489 comes up with is not heard.
+ * Once the chip is quiet, CB2 becomes a manual output, low - bits 7-5
+ * of the PCR.
  */
 #define	PCR_CB2		%11100000
-#define	PCR_CB2_HIGH	%11100000
+#define	PCR_CB2_LOW	%11000000
 
 /*
  * The beeps of the SN76489. The chip runs on the same oscillator as the

@@ -694,13 +694,14 @@ static struct {
 	int spk_loud;		/* channels that sounded then */
 } sn;
 
-/* The speaker is in series with a MOSFET whose gate is CB2, pulled
-   down: it is on only while CB2 is a manual output driven high, PCR
-   bits 7-5 = 111. Until then the tone the chip comes up with is not
-   heard - the chip starts with every volume at 0 here, the loudest. */
+/* The speaker is in series with a MOSFET, which CB2 drives through an
+   inverter, CB2 pulled up: it is on only while CB2 is a manual output
+   driven low, PCR bits 7-5 = 110. Until then the tone the chip comes up
+   with is not heard - the chip starts with every volume at 0 here, the
+   loudest. */
 static int speaker_on(void)
 {
-	return (via2.pcr & 0xe0) == 0xe0;
+	return (via2.pcr & 0xe0) == 0xc0;
 }
 
 static void via2_write_pcr(void)

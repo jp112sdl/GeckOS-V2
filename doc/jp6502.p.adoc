@@ -85,10 +85,11 @@ and init starts fsdev, fsfat32, and the shells.
 The SN76489 is silenced first thing - it comes up playing whatever its
 registers hold - and gives a short beep: the board is starting.
 
-The speaker is in series with a MOSFET whose gate is CB2 of VIA2, with a
-pull-down resistor. After a reset CB2 is an input and the speaker is
-off, so the random tone is not heard; the kernel drives CB2 high once
-the chip is silent. Without that circuit, CB2 is simply unused.
+The speaker is in series with a MOSFET, which CB2 of VIA2 drives
+through a second one as an inverter: CB2 high or not driven is off, low
+is on. After a reset CB2 is an input, pulled up, and the speaker is off,
+so the random tone is not heard; the kernel drives CB2 low once the chip
+is silent. Without that circuit, CB2 is simply unused.
 
 When everything is started, init sends a bell to the console: one short
 beep. When something could not be started - most likely the shell,
