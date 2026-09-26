@@ -10,7 +10,8 @@
  *                (bit-banged SPI) on port B
  *   $8400        R6551 ACIA, 19200 baud by default
  *   $8800        VIA2 - SN76489 (READY always low), LED on PB7, D-pad
- *   $9000        VIA1 - LCD (reads back "not busy")
+ *   $9000        VIA1 - LCD (reads back "not busy"), DS3231 clock on I2C
+ *                (PA0 = SCL, PA1 = SDA, pull-ups on the module)
  *   $a000-$ffff  ROM, the upper 24k of a 32k image
  *
  * The IRQ line is the wired-AND of the three VIAs and the ACIA, like on
@@ -32,6 +33,13 @@
  *     -S            a strict card: while it still has to send part of an
  *                   answer - the CRC after a block, say - it does not listen
  *                   for a command; eight clocks with CS high end the answer
+ *     -k TIME       the clock starts at TIME, "YYYY-MM-DD HH:MM[:SS]";
+ *                   without it at the time of the host
+ *     -K            the clock has never run: it starts at 2000-01-01 with
+ *                   its oscillator-stopped flag set, as a new one does
+ *     -R            no clock module: no pull-ups either, and the lines
+ *                   keep the last level the VIA gave them (the bus holders
+ *                   of the W65C22S)
  *     -x FILE       script, see below; without one the terminal is
  *                   connected to the ACIA (Ctrl-] quits)
  *     -t SECONDS    stop after this much emulated time
@@ -54,6 +62,7 @@
  *   lcd                   print the LCD
  *   led                   print the LED state
  *   sound                 print the SN76489 volumes and the speaker
+ *   rtc                   print the time of the clock
  *   regs                  print the CPU registers
  *   ilreset               restart the -I measurement and the overrun count
  *   jump ADDR [X]         continue at ADDR (hex), interrupts off, XR set
@@ -68,6 +77,7 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <time.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -866,6 +876,233 @@ static void via1_write_pa_hook(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* DS3231 on I2C, VIA1 PA0 = SCL, PA1 = SDA                            */
+
+/*
+ * The lines follow every write to port A or its DDR; the clock looks at
+ * them on each change, like the real one: START and STOP, a bit taken on
+ * the rising edge of SCL, its own bits and acknowledges put out after the
+ * falling one. The AT24C32 of the usual modules answers at its address
+ * too, but keeps nothing.
+ */
+
+#define	RTC_I2C		0x68
+#define	EEPROM_I2C	0x57
+
+enum { I2C_IDLE, I2C_ADDR, I2C_WRITE, I2C_READ, I2C_OFF };
+
+static struct {
+	int present;		/* a module on the bus, with its pull-ups */
+	int stopped;		/* -K */
+	time_t base;		/* its time at base_cyc, the fields taken as UTC */
+	u64 base_cyc;
+	u8 reg[19];
+	int scl, sda;		/* the levels on the lines */
+	u8 hold;		/* without a module: what the bus holders keep */
+	int st, n, dev, first, wrote, pull, fight;
+	u8 sh, ptr, cur;
+} rtc = { .present = 1, .scl = 1, .sda = 1, .hold = 3 };
+
+static time_t rtc_now(void)
+{
+	return rtc.base + (time_t)((cycles - rtc.base_cyc) / (clock_mhz * 1e6));
+}
+
+static u8 tobcd(int v) { return (v / 10) << 4 | v % 10; }
+static int frombcd(u8 b) { return (b >> 4) * 10 + (b & 15); }
+
+/* a START copies the time into the registers that are read */
+static void rtc_latch(void)
+{
+	time_t t = rtc_now();
+	struct tm tm;
+	gmtime_r(&t, &tm);
+	rtc.reg[0] = tobcd(tm.tm_sec);
+	rtc.reg[1] = tobcd(tm.tm_min);
+	rtc.reg[2] = tobcd(tm.tm_hour);
+	rtc.reg[3] = tm.tm_wday + 1;
+	rtc.reg[4] = tobcd(tm.tm_mday);
+	rtc.reg[5] = tobcd(tm.tm_mon + 1) | (tm.tm_year >= 200 ? 0x80 : 0);
+	rtc.reg[6] = tobcd(tm.tm_year % 100);
+}
+
+/* the time registers were written: the clock goes on from there */
+static void rtc_set(void)
+{
+	struct tm tm;
+	memset(&tm, 0, sizeof tm);
+	if (rtc.reg[2] & 0x40)
+		fprintf(stderr, "\nDS3231: 12 hour mode is not modelled\n");
+	tm.tm_sec = frombcd(rtc.reg[0] & 0x7f);
+	tm.tm_min = frombcd(rtc.reg[1] & 0x7f);
+	tm.tm_hour = frombcd(rtc.reg[2] & 0x3f);
+	tm.tm_mday = frombcd(rtc.reg[4] & 0x3f);
+	tm.tm_mon = frombcd(rtc.reg[5] & 0x1f) - 1;
+	tm.tm_year = 100 + frombcd(rtc.reg[6]) + (rtc.reg[5] & 0x80 ? 100 : 0);
+	rtc.base = timegm(&tm);
+	rtc.base_cyc = cycles;
+}
+
+static u8 rtc_read(void)
+{
+	if (rtc.dev != RTC_I2C)
+		return 0xff;
+	if (rtc.ptr > 0x12)
+		rtc.ptr = 0;
+	if (rtc.ptr == 0)
+		rtc_latch();
+	return rtc.reg[rtc.ptr++];
+}
+
+static void rtc_write(u8 v)
+{
+	u8 r = rtc.ptr > 0x12 ? 0 : rtc.ptr;
+	if (r <= 6) {
+		rtc.reg[r] = v;
+		rtc.wrote = 1;
+	} else if (r == 0x0f) {
+		/* OSF and the alarm flags can only be cleared */
+		rtc.reg[r] = (rtc.reg[r] & v & 0x83) | (v & 0x08) | (rtc.reg[r] & 0x04);
+	} else if (r < 0x11) {
+		rtc.reg[r] = v;
+	}
+	rtc.ptr = r + 1;
+}
+
+static void rtc_update(void)
+{
+	u8 drv = via1.ddra & 3, lvl = via1.ora & drv;
+	int scl, sda;
+	if (rtc.present) {
+		if (lvl && !rtc.fight) {
+			rtc.fight = 1;
+			fprintf(stderr, "\nDS3231: VIA1 drives an I2C line high\n");
+		}
+		scl = drv & 1 ? lvl & 1 : 1;
+		sda = drv & 2 ? lvl >> 1 & 1 : 1;
+		if (rtc.pull)
+			sda = 0;
+	} else {
+		rtc.hold = (rtc.hold & ~drv) | lvl;
+		scl = rtc.hold & 1;
+		sda = rtc.hold >> 1 & 1;
+	}
+	int oscl = rtc.scl, osda = rtc.sda;
+	rtc.scl = scl;
+	rtc.sda = sda;
+	if (!rtc.present)
+		return;
+
+	if (scl && oscl && sda != osda) {
+		if (rtc.wrote)
+			rtc_set();
+		rtc.wrote = 0;
+		rtc.pull = 0;
+		if (!sda) {			/* START */
+			rtc_latch();
+			rtc.st = I2C_ADDR;
+			rtc.n = 0;
+		} else {			/* STOP */
+			rtc.st = I2C_IDLE;
+		}
+		return;
+	}
+	if (scl && !oscl) {
+		if (++rtc.n <= 8) {
+			if (rtc.st == I2C_ADDR || rtc.st == I2C_WRITE)
+				rtc.sh = rtc.sh << 1 | sda;
+		} else if (rtc.st == I2C_READ && sda) {
+			rtc.st = I2C_OFF;	/* not acknowledged: that was all */
+		}
+	} else if (!scl && oscl) {
+		if (rtc.n == 8) {
+			switch (rtc.st) {
+			case I2C_ADDR:
+				rtc.dev = rtc.sh >> 1;
+				if (rtc.dev == RTC_I2C || rtc.dev == EEPROM_I2C) {
+					rtc.pull = 1;
+					rtc.first = 1;
+				} else {
+					rtc.st = I2C_OFF;
+				}
+				break;
+			case I2C_WRITE:
+				if (rtc.dev == RTC_I2C) {
+					if (rtc.first)
+						rtc.ptr = rtc.sh;
+					else
+						rtc_write(rtc.sh);
+				}
+				rtc.first = 0;
+				rtc.pull = 1;
+				break;
+			case I2C_READ:
+				rtc.pull = 0;	/* for the master's acknowledge */
+				break;
+			}
+		} else if (rtc.n == 9) {
+			rtc.n = 0;
+			rtc.pull = 0;
+			if (rtc.st == I2C_ADDR)
+				rtc.st = rtc.sh & 1 ? I2C_READ : I2C_WRITE;
+			if (rtc.st == I2C_READ) {
+				rtc.cur = rtc_read();
+				rtc.pull = !(rtc.cur & 0x80);
+			}
+		} else if (rtc.st == I2C_READ && rtc.n < 8) {
+			rtc.pull = !(rtc.cur & (0x80 >> rtc.n));
+		}
+		rtc.sda = rtc.pull ? 0 : drv & 2 ? lvl >> 1 & 1 : 1;
+	}
+}
+
+static u8 via1_read_pa(via_t *v)
+{
+	(void)v;
+	return 0xfc | rtc.scl | rtc.sda << 1;
+}
+
+static void rtc_init(const char *when)
+{
+	struct tm tm;
+	memset(&tm, 0, sizeof tm);
+	if (rtc.stopped) {
+		tm.tm_year = 100;
+		tm.tm_mday = 1;
+	} else if (when) {
+		int y, mo, d, h, mi, sec = 0;
+		if (sscanf(when, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) < 5) {
+			fprintf(stderr, "-k wants \"YYYY-MM-DD HH:MM[:SS]\"\n");
+			exit(1);
+		}
+		tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
+		tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = sec;
+	} else {
+		time_t t = time(NULL);
+		localtime_r(&t, &tm);
+	}
+	rtc.base = timegm(&tm);
+	rtc.base_cyc = cycles;
+	rtc.reg[0x0e] = 0x1c;
+	rtc.reg[0x0f] = rtc.stopped ? 0x88 : 0x08;
+	rtc.reg[0x11] = 25;		/* degrees */
+}
+
+static void rtc_print(FILE *f)
+{
+	if (!rtc.present) {
+		fprintf(f, "RTC none\n");
+		return;
+	}
+	time_t t = rtc_now();
+	struct tm tm;
+	gmtime_r(&t, &tm);
+	fprintf(f, "RTC %04d-%02d-%02d %02d:%02d:%02d%s\n", tm.tm_year + 1900,
+		tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+		rtc.reg[0x0f] & 0x80 ? " (oscillator stopped flag)" : "");
+}
+
+/* ------------------------------------------------------------------ */
 /* bus                                                                 */
 
 static int led_state;
@@ -894,8 +1131,10 @@ static void io_write(u16 a, u8 d)
 	}
 	if (a >= 0x9000 && a < 0xa000) {
 		via_write(&via1, a & 15, d);
-		if ((a & 15) == 1 || (a & 15) == 15 || (a & 15) == 3)
+		if ((a & 15) == 1 || (a & 15) == 15 || (a & 15) == 3) {
 			via1_write_pa_hook();
+			rtc_update();
+		}
 		return;
 	}
 }
@@ -1284,6 +1523,8 @@ static void reset(void)
 	sn.lastpb = 0xff;
 	sn.spk = 0;
 	via1.read_pb = via1_read_pb;
+	via1.read_pa = via1_read_pa;
+	rtc_update();
 	sd.lastpb = 0xff; sd.miso = 1;
 	acia_reset();
 	memset(lcd.ddram, ' ', sizeof lcd.ddram);
@@ -1444,6 +1685,8 @@ static int run_script(FILE *sf, double tmax)
 			lcd_print(stdout);
 		} else if (!strcmp(line, "sound")) {
 			sn_print(stdout);
+		} else if (!strcmp(line, "rtc")) {
+			rtc_print(stdout);
 		} else if (!strcmp(line, "led")) {
 			printf("LED %s\n", led_state ? "on" : "off");
 		} else if (!strcmp(line, "regs")) {
@@ -1503,10 +1746,10 @@ static void run_interactive(double tmax)
 
 int main(int argc, char **argv)
 {
-	const char *script = NULL, *sdimg = NULL, *labfile = NULL;
+	const char *script = NULL, *sdimg = NULL, *labfile = NULL, *rtctime = NULL;
 	double tmax = 0;
 	int o;
-	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:S")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:Sk:KR")) != -1) {
 		switch (o) {
 		case 'c': clock_mhz = atof(optarg); break;
 		case 's': sdimg = optarg; break;
@@ -1522,8 +1765,11 @@ int main(int argc, char **argv)
 		case 'z': sd.cmd0_skip = atoi(optarg); break;
 		case 'd': sd.read_ms = atof(optarg); break;
 		case 'S': sd.strict = 1; break;
+		case 'k': rtctime = optarg; break;
+		case 'K': rtc.stopped = 1; break;
+		case 'R': rtc.present = 0; break;
 		default:
-			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
+			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-k time] [-K] [-R] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
 			return 1;
 		}
 	}
@@ -1541,6 +1787,7 @@ int main(int argc, char **argv)
 		if (!sd.img) { perror(sdimg); return 1; }
 	}
 	if (labfile) load_labels(labfile);
+	rtc_init(rtctime);
 	for (int i = 0; i < 0x8000; i++) ram[i] = (i * 7 + 13) & 0xff;	/* not zero */
 	reset();
 

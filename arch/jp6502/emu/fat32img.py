@@ -10,7 +10,8 @@ fat32img.py - make and inspect FAT32 images for the JP6502 emulator.
       plain upper case 8.3 get a long file name entry too, the way PCs
       and Macs write them.
 
-  fat32img.py ls IMG [PATH]         list a directory, long names in []
+  fat32img.py ls IMG [PATH]         list a directory with the times the
+                                    files were written, long names in []
   fat32img.py cat IMG PATH          file contents to stdout
   fat32img.py check IMG             walk everything, cross-check the FAT
 """
@@ -333,7 +334,10 @@ def main():
             if attr & 0x08:
                 continue
             kind = "<DIR>" if attr & 0x10 else "%9d" % size
-            print("%-12s %9s  clus %-6d %s" % (n, kind, clus, "[%s]" % lfn if lfn else ""))
+            t, d = struct.unpack_from("<HH", fs.read(lba), off + 22)
+            when = "%04d-%02d-%02d %02d:%02d:%02d" % (1980 + (d >> 9), d >> 5 & 15, d & 31,
+                                                      t >> 11, t >> 5 & 63, (t & 31) * 2)
+            print("%-12s %9s  %s  clus %-6d %s" % (n, kind, when, clus, "[%s]" % lfn if lfn else ""))
     elif args.cmd == "cat":
         fs = Fat32(args.image)
         e = fs.lookup(args.path)
