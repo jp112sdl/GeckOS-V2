@@ -576,7 +576,8 @@ nosig	  ldx threadTab + TH_TASK,y
 	  ; note if we have tasks waiting for signals
 	  cmp #TTS_PAUSE
 	  bne nopause
-	  inc countPaused
+	  sta countPaused	; a flag - counting wrapped to 0 after 256
+				; idle rounds, and "no task" reset the machine
 	  ; check if task is allowed to run
 nopause	  cmp #TTS_RUN
 	  bne next
