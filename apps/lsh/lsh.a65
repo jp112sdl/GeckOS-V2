@@ -454,14 +454,44 @@ redir_pipe .(
 	jmp ende
 
 pipend
-	lda #"?"
-	jsr putc
-
-	lda #E_OK	; only close streams
-	sec
-	rts
+	jmp rednoname		; ac is the error of pipe
 	.)
 
+
+/*
+ * A redirection or pipe could not be set up. rederr: ac is the error,
+ * the name is at (ap),ty; rednoname: ac is the error, no name;
+ * rednopar: the name is missing. Prints the reason on stderr, then
+ * returns like the parser does on errors.
+ */
+rednopar .(
+	lda #E_NOPAR
+&rednoname
+	pha
+	jsr ecrlfout
+	jmp msg
+&rederr	pha
+	jsr ecrlfout
+	lda ty
+	clc
+	adc ap
+	pha
+	lda #0
+	adc ap+1
+	tay
+	pla
+	jsr etxtout
+	lda #<colsp
+	ldy #>colsp
+	jsr etxtout
+msg	pla
+	jsr strerror
+	jsr etxtout
+	lda #E_OK		; only close streams
+	sec
+	rts
+colsp	.byt $3a, " ", 0	; colon and blank
+	.)
 
 redir_err .(
 	stx tx
@@ -504,7 +534,9 @@ noap
 	ldx #OPEN_WR
 	pla
 	jsr fopen
-	bcs openend
+	bcc opened
+	jmp rederr
+opened
 	txa
 	pha
 	lsr ta
@@ -537,12 +569,7 @@ in2	lda (ap),y
 	bne in2
 	jmp pars
 openend	
-	lda #"?"
-	jsr putc
-
-	lda #E_OK
-	sec
-	rts
+	jmp rednopar
 	.)
 
 redir_out .(
@@ -572,11 +599,7 @@ redir_inpipe .(
 	iny 
 	lda (ap),y
 	bne inok
-	lda #"?"
-	jsr putc
-	lda #E_OK
-	sec
-	rts
+	jmp rednopar
 inok	sty ty
 	tya
 	clc
@@ -621,7 +644,9 @@ inok 	sty ty
 	pla
 	ldx #OPEN_RD
 	jsr fopen
-	bcs openend
+	bcc opened
+	jmp rederr
+opened
 	txa
 	pha
 	ldx buf+0;	stdin
@@ -636,12 +661,7 @@ in2	lda (ap),y
 	bne in2
 	jmp pars
 openend	
-	lda #"?"
-	jsr putc
-
-	lda #E_OK
-	sec
-	rts
+	jmp rednopar
 	.)
 
 #ifdef LSH_DEBUG
@@ -655,14 +675,28 @@ openend
 /* 
  * readline reads a line from stdin and puts it into buf. It returns a
  * pointer to the command line in a/y.
- * Later command line history / command line editing will go here
- * For now we ignore codes > 127, and most control codes <32
+ * We ignore codes > 127, and most control codes <32.
+ *
+ * The last HISTNUM lines are kept (up to HISTLEN-1 characters, empty
+ * ones and repeats are not). Cursor up and down go through them: the
+ * console sends the codes 130 and 131, terminals ESC [ A and ESC [ B
+ * (or ESC O A/B). A line from the history can be edited like a typed
+ * one.
  */
+#define	HISTNUM	5
+#define	HISTLEN	64
+
 readline .(
+	.zero
+hp	.word 0
 	.bss
 instr	.byt 0
 prev 	.byt 0
+esc	.byt 0		/* 1 after ESC, 2 inside ESC [ or ESC O */
+hpos	.byt 0		/* 0 the new line, n the n-th newest in hist */
+hist	.dsb HISTNUM*HISTLEN	/* newest first */
 	.data
+hcnt	.byt 0		/* lines in hist - .data, so it starts at 0 */
 promptxt .byt PROMPTCHAR,0
 	.text
 
@@ -674,11 +708,46 @@ promptxt .byt PROMPTCHAR,0
 
 	ldy #0
 	sty prev
+	sty esc
+	sty hpos
 l0
 	ldx instr
 	sec
 	jsr fgetc
-	bcs end
+	bcc got
+	rts		; error or end of input, c=1
+got	ldx esc
+	beq noesc
+	dex
+	bne esc2
+	cmp #"["	; after ESC, "[" or "O" start a cursor key
+	beq esc1
+	cmp #"O"
+	beq esc1
+	ldx #0		; anything else is taken as it is
+	stx esc
+	beq noesc
+esc1	inc esc
+	bne l0
+esc2	cmp #$40	; parameters, up to the final character
+	bcc l0
+	ldx #0
+	stx esc
+	cmp #"A"
+	beq up
+	cmp #"B"
+	beq down
+	bne l0
+
+noesc	cmp #27
+	bne n27
+	lda #1
+	sta esc
+	bne l0
+n27	cmp #130	; cursor up and down from the console
+	beq up
+	cmp #131
+	beq down
 	cmp #10
 	bne nolf
 	ldx prev
@@ -707,17 +776,104 @@ backspace
 	cpy #0
 	beq l0
 	dey
-	jsr putc
+	jsr bsout
 	jmp l0
+
+up	lda hpos	; an older line, if there is one
+	cmp hcnt
+	bcs l0x
+	inc hpos
+	bne recall
+down	lda hpos	; a newer one, down to the empty new line
+	beq l0x
+	dec hpos
+recall	jsr erase
+	lda hpos
+	beq l0x
+	sec		; hp = hist + (hpos-1) * 64
+	sbc #1
+	pha
+	lsr
+	lsr
+	sta hp+1
+	pla
+	and #3
+	asl
+	asl
+	asl
+	asl
+	asl
+	asl
+	clc
+	adc #<hist
+	sta hp
+	lda hp+1
+	adc #>hist
+	sta hp+1
+	ldy #0
+rc	lda (hp),y
+	beq l0x
+	sta buf,y
+	jsr putc
+	iny
+	bne rc
+l0x	jmp l0
 
 endline	lda #0
 	sta buf,y
-
+	cpy #0		; into the history
+	beq nosave
+	cpy #HISTLEN
+	bcs nosave
+	lda hcnt
+	beq new
+	ldx #0		; not when it is the newest one again
+c1	lda buf,x
+	cmp hist,x
+	bne new
+	cmp #0
+	beq nosave
+	inx
+	bne c1
+new	ldx #(HISTNUM-1)*HISTLEN-1	; move the others down
+sh	lda hist,x
+	sta hist+HISTLEN,x
+	dex
+	cpx #$ff
+	bne sh
+	ldx #0
+cp	lda buf,x
+	sta hist,x
+	beq cpe
+	inx
+	bne cp
+cpe	lda hcnt
+	cmp #HISTNUM
+	bcs nosave
+	inc hcnt
+nosave
 	lda #<buf
 	ldy #>buf
 	clc
 end
 	rts
+
+	/* take back the yr characters of the line on the screen */
+erase	cpy #0
+	beq ee
+	jsr bsout
+	dey
+	jmp erase
+ee	rts
+
+	/* one character back, blanked - a terminal only moves the
+	   cursor on BS, the console deletes, this does both right */
+bsout	lda #8
+	jsr putc
+	lda #" "
+	jsr putc
+	lda #8
+	jmp putc
 	.)
 
 ;----------------------------------------------
@@ -1270,7 +1426,6 @@ bgc_uname .(
 
 	; set environment value
 bic_set	.(
-	inx
 	txa
 	clc
 	adc #<buf+3
@@ -1474,7 +1629,6 @@ pipeinchar
 	.)
 
 bic_cd	.(
-	inx
 	txa
 	clc
 	adc #<buf+3
@@ -1487,7 +1641,6 @@ bic_cd	.(
 	.)
 
 bic_source .(
-	inx
 	txa
 	clc
 	adc #<buf+3

@@ -273,11 +273,11 @@ rxe1a     bcs rxe1                      /* Fehler dann Ende             */
           ldy cnt                       /* Stream als                   */
           lda #DC_PS                    /* Ausgabe des Devices          */
           jsr DEVCMD                    /* registrieren                 */
-          bcs rxe1                      /* Fehler dann Ende             */
+          bcs rxea                      /* Fehler (z.B. E_DON) melden   */
           ldx dev                       /* Device-Nummer zurueckholen    */
           lda #DC_RX_ON                 /* Uebertragung starten          */
           jsr DEVCMD                    /* und los...                   */
-          bcs rxe1                      /* Fehler dann Ende             */
+          bcs rxea                      /* Fehler dann Ende             */
           ldy cnt                       /* hier geht's normal weiter    */
           jmp rxok
 
@@ -309,11 +309,11 @@ rxr1      lda PCBUF,y
           ldy cnt
           lda #DC_GS
           jsr DEVCMD
-          bcs rxe1
+          bcs rxea			/* e.g. E_DON: device in use */
           ldx dev
           lda #DC_TX_ON
           jsr DEVCMD
-          bcs rxe1
+          bcs rxea
           ldy cnt
           jmp rxok
 
@@ -326,7 +326,7 @@ rx3       lda #E_NOTIMP
 rxok      lda #E_OK
           .byt $2c
 rxe1      lda #E_FNOFIL
-          sta PCBUF+FS_X_ERR
+rxea      sta PCBUF+FS_X_ERR		/* ac = error of the device */
           ldx owntask
           stx PCBUF+FS_X_ENV
           ldy actfil
