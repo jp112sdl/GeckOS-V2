@@ -23,7 +23,15 @@
  * Usage:
  *   jp6502emu [options] rom.bin
  *     -c MHZ        clock in MHz (default 4)
- *     -s FILE       SD card image (raw, 512-byte sectors)
+ *     -s FILE       SD card image (raw, 512-byte sectors); without one
+ *                   the slot is empty and MISO stays high
+ *     -z N          the card does not answer the first N CMD0, as some
+ *                   cards do not right after power-up
+ *     -d MS         the card takes MS milliseconds to find a block before
+ *                   it sends the data token (up to 100 are allowed)
+ *     -S            a strict card: while it still has to send part of an
+ *                   answer - the CRC after a block, say - it does not listen
+ *                   for a command; eight clocks with CS high end the answer
  *     -x FILE       script, see below; without one the terminal is
  *                   connected to the ACIA (Ctrl-] quits)
  *     -t SECONDS    stop after this much emulated time
@@ -541,6 +549,13 @@ static struct {
 	u8 cmd[6]; int cmdlen;
 	u8 resp[1024]; int resp_len, resp_pos;
 	int app, idle_count, ready;
+	int cmd0_skip;		/* -z: CMD0s still to be ignored */
+	double read_ms;		/* -d: time until the data token of a read */
+	int tok_pos; u64 tok_at;	/* where the token is in resp, and when */
+	int strict;		/* -S */
+	int oblig;		/* resp up to here has to be clocked out */
+	int busy_byte;		/* the byte going out now is one of those */
+	int hiclk;		/* clocks with CS high since it went high */
 	/* write */
 	int wr_state; u32 wr_block; int wr_count; u8 wr_buf[514];
 	long reads, writes;
@@ -558,6 +573,7 @@ static void sd_command(void)
 	u32 arg = (sd.cmd[1] << 24) | (sd.cmd[2] << 16) | (sd.cmd[3] << 8) | sd.cmd[4];
 	u8 ff = 0xff;
 	sd.resp_len = sd.resp_pos = 0;
+	sd.tok_pos = -1;
 	sd_respond(&ff, 1);	/* Ncr */
 	int app = sd.app; sd.app = 0;
 	u8 r1 = sd.ready ? 0x00 : 0x01;
@@ -568,7 +584,9 @@ static void sd_command(void)
 		return;
 	}
 	switch (c) {
-	case 0: sd.ready = 0; sd.idle_count = 0; r1 = 0x01; sd_respond(&r1, 1); break;
+	case 0:
+		if (sd.cmd0_skip > 0) { sd.cmd0_skip--; break; }	/* no R1 */
+		sd.ready = 0; sd.idle_count = 0; r1 = 0x01; sd_respond(&r1, 1); break;
 	case 8: { u8 r[5] = { r1, 0, 0, 1, sd.cmd[4] }; sd_respond(r, 5); break; }
 	case 55: sd.app = 1; sd_respond(&r1, 1); break;
 	case 58: { u8 r[5] = { r1, 0xc0, 0xff, 0x80, 0x00 }; sd_respond(r, 5); break; }
@@ -581,8 +599,12 @@ static void sd_command(void)
 			if (fread(buf, 1, 512, sd.img) != 512) { /* past the end: zeros */ }
 		}
 		sd.reads++;
-		u8 r[3] = { r1, 0xff, 0xfe };
-		sd_respond(r, 3);
+		u8 r[2] = { r1, 0xff };
+		sd_respond(r, 2);
+		sd.tok_pos = sd.resp_len;
+		sd.tok_at = cycles + (u64)(sd.read_ms * clock_mhz * 1000);
+		u8 tok = 0xfe;
+		sd_respond(&tok, 1);
 		sd_respond(buf, 512);
 		u8 crc[2] = { 0, 0 };
 		sd_respond(crc, 2);
@@ -598,6 +620,8 @@ static void sd_command(void)
 
 static void sd_byte_in(u8 b)
 {
+	if (sd.strict && sd.busy_byte && sd.wr_state == 0)
+		return;		/* still answering, not listening */
 	if (sd.wr_state == 1) {		/* waiting for the data token */
 		if (b == 0xfe) { sd.wr_state = 2; sd.wr_count = 0; }
 		return;
@@ -615,6 +639,7 @@ static void sd_byte_in(u8 b)
 			sd.resp_len = sd.resp_pos = 0;
 			u8 r[6] = { 0x05, 0x00, 0x00, 0x00, 0xff, 0xff };
 			sd_respond(r, 6);
+			sd.oblig = sd.resp_len - 2;	/* response and busy */
 		}
 		return;
 	}
@@ -624,11 +649,15 @@ static void sd_byte_in(u8 b)
 	if (sd.cmdlen == 6) {
 		sd.cmdlen = 0;
 		sd_command();
+		sd.oblig = sd.resp_len;
 	}
 }
 
 static u8 sd_next_out(void)
 {
+	sd.busy_byte = sd.resp_pos < sd.oblig;
+	if (sd.resp_pos == sd.tok_pos && cycles < sd.tok_at)
+		return 0xff;	/* still looking for the block */
 	if (sd.resp_pos < sd.resp_len)
 		return sd.resp[sd.resp_pos++];
 	return 0xff;
@@ -642,6 +671,9 @@ static void sd_pb_write(via_t *v)
 	if (pb & SD_CS) {
 		sd.incount = 0;
 		sd.miso = 1;
+		if (!(last & SD_CS)) sd.hiclk = 0;
+		if (!(last & SD_SCK) && (pb & SD_SCK) && ++sd.hiclk == 8)
+			sd.resp_pos = sd.resp_len;	/* the answer is over */
 		return;
 	}
 	if ((last & SD_CS) && !(pb & SD_CS)) {
@@ -670,7 +702,7 @@ static u8 via3_read_pb(via_t *v)
 {
 	(void)v;
 	u8 pins = 0xff;
-	if (!sd.miso) pins &= ~SD_MISO;
+	if (sd.img && !sd.miso) pins &= ~SD_MISO;	/* no card: pulled up */
 	return pins;
 }
 
@@ -1474,7 +1506,7 @@ int main(int argc, char **argv)
 	const char *script = NULL, *sdimg = NULL, *labfile = NULL;
 	double tmax = 0;
 	int o;
-	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:S")) != -1) {
 		switch (o) {
 		case 'c': clock_mhz = atof(optarg); break;
 		case 's': sdimg = optarg; break;
@@ -1487,8 +1519,11 @@ int main(int argc, char **argv)
 		case 'I': opt_ilat = 1; break;
 		case 'P': opt_prof = 1; break;
 		case 'b': opt_break = strtol(optarg, NULL, 16); break;
+		case 'z': sd.cmd0_skip = atoi(optarg); break;
+		case 'd': sd.read_ms = atof(optarg); break;
+		case 'S': sd.strict = 1; break;
 		default:
-			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
+			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
 			return 1;
 		}
 	}
