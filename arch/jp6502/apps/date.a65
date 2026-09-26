@@ -1,0 +1,229 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * date - show or set the DS3231 clock of the JP6502
+ *
+ *	date				2026-09-26 14:03:12
+ *	date 2026-09-26 14:03[:12]	sets it
+ *
+ * Only the digits count when setting, so 202609261403 does as well; the
+ * year is 2000-2099. The weekday of the clock is left alone. Setting it
+ * also clears the flag that says the clock has stopped (it had no power
+ * and no battery), which "date" otherwise points out.
+ */
+
+#include "lib6502.i65"
+#include "kernel.i65"
+#include "kdefs.i65"
+#include "jp6502def.i65"
+
+main	.(
+	.zero
+argp	.word 0
+	.bss
+dig	.dsb 14		/* the digits given */
+newt	.dsb 7		/* the time to set, as the clock keeps it */
+stat	.byt 0
+	.text
+
+	sta argp
+	sty argp+1
+	ldy #0
+l0	lda (argp),y		; past the program name
+	beq args
+	iny
+	bne l0
+args	iny
+	lda (argp),y
+	beq show
+	jsr parse
+	bcc set
+	lda #<usage
+	ldy #>usage
+	jsr strout
+	lda #E_ILLPAR
+	rts
+
+noclk	jsr unlock
+	lda #<nock
+	ldy #>nock
+	jsr strout
+	lda #E_CONFIG
+	rts
+
+set	jsr lock
+	bcs noclk
+	lda #0			; read first, for the weekday
+	ldy #7
+	jsr rtc_rd
+	bcs noclk
+	ldx #6
+c	cpx #3
+	beq n
+	lda newt,x
+	sta rtcbuf,x
+n	dex
+	bpl c
+	lda #0
+	ldy #7
+	jsr rtc_wr
+	bcs noclk
+	jsr status
+	bcs noclk
+	and #$7f		; it runs now
+	sta rtcbuf
+	lda #$0f
+	ldy #1
+	jsr rtc_wr
+	bcs noclk
+	jsr unlock
+
+show	jsr lock
+	bcs noclk
+	jsr status
+	bcs noclk
+	sta stat
+	lda #0
+	ldy #7
+	jsr rtc_rd
+	bcs noclk
+	jsr unlock
+
+	lda #"2"
+	jsr chrout
+	lda #"0"
+	jsr chrout
+	ldx #0
+p	ldy order,x
+	lda rtcbuf,y
+	and mask,x
+	jsr hexout		; BCD: the decimal digits
+	lda between,x
+	beq pd
+	jsr chrout
+	inx
+	bne p
+pd	bit stat
+	bpl ok
+	lda #<stopped
+	ldy #>stopped
+	jsr strout
+ok	jsr crlfout
+	lda #0
+	rts
+
+	/* the bus to ourselves; c=1 if there is no module on it */
+lock	ldx #SEM_I2C
+	sec
+	jsr PSEM2
+	jmp i2c_check
+
+unlock	ldx #SEM_I2C
+	jmp VSEM
+
+	/* the status register in AC and rtcbuf */
+status	lda #$0f
+	ldy #1
+	jsr rtc_rd
+	lda rtcbuf
+	rts
+
+	/* the digits from (argp),y on into newt; c=1 if they are no time */
+parse	.(
+	ldx #0
+pl	lda (argp),y
+	bne pc
+	iny			; end of an argument,
+	lda (argp),y
+	beq pend		; and of the last one
+pc	cmp #"0"
+	bcc pn
+	cmp #"9"+1
+	bcs pn
+	cpx #14
+	bcs pbad
+	and #$0f
+	sta dig,x
+	inx
+pn	iny
+	bne pl
+pbad	sec
+	rts
+
+pend	cpx #14
+	beq pall
+	cpx #12
+	bne pbad
+	lda #0			; no seconds
+	sta dig+12
+	sta dig+13
+pall	lda dig			; 20xx
+	cmp #2
+	bne pbad
+	lda dig+1
+	bne pbad
+	ldx #0
+	ldy #2
+pp	lda dig,y		; two digits into BCD
+	asl
+	asl
+	asl
+	asl
+	ora dig+1,y
+	cmp lo,x
+	bcc pbad
+	cmp hi,x
+	bcs pbad
+	phy
+	ldy reg,x
+	sta newt,y
+	ply
+	iny
+	iny
+	inx
+	cpx #6
+	bcc pp
+	clc
+	rts
+	.)
+
+	/* year, month, day, hour, minute, second: from, to (BCD, +1) */
+lo	.byt $00, $01, $01, $00, $00, $00
+hi	.byt $9a, $13, $32, $24, $60, $60
+reg	.byt 6, 5, 4, 2, 1, 0	/* ... and which register */
+
+	/* the same order for showing it */
+order	.byt 6, 5, 4, 2, 1, 0
+mask	.byt $ff, $1f, $3f, $3f, $7f, $7f
+between	.asc "-- ::", 0
+
+usage	.asc "usage: date [YYYY-MM-DD HH:MM[:SS]]", 13, 10, 0
+nock	.asc "date: no clock on the I2C bus - try i2cscan", 13, 10, 0
+stopped	.asc " - clock was stopped, set it", 0
+
+#include "apps/common.a65"
+	.)
+
+	/* outside of main, whose labels would clash with its local ones */
+#include "devices/i2c_jp.a65"

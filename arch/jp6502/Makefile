@@ -38,6 +38,9 @@ APPS=../../apps/lsh/lsh ../../apps/lmon/lmon \
 	../../sysapps/ps ../../sysapps/kill ../../sysapps/lsmem \
 	../../sysapps/ontty
 
+# programs for the hardware of this board
+JPAPPS=apps/date apps/i2cscan
+
 all: $(TRG)
 
 # assembled every time - it takes a second, and CLOCK and SHELLS
@@ -79,10 +82,13 @@ $(APPS):
 	$(MAKE) -C ../../apps
 	$(MAKE) -C ../../sysapps
 
-sdcard: $(APPS)
+$(JPAPPS): %: %.a65 devices/i2c_jp.a65 jp6502def.i65
+	$(XA) -R -I../../include -I. -I../.. -LLIB6502 -LOSA2KERNEL $< -o $@
+
+sdcard: $(APPS) $(JPAPPS)
 	rm -rf boot/sdcard
 	mkdir -p boot/sdcard
-	cp $(APPS) boot/sdcard/
+	cp $(APPS) $(JPAPPS) boot/sdcard/
 	@echo "copy the files in boot/sdcard into the root of a FAT32 card"
 
 sdimg: sdcard
@@ -99,6 +105,6 @@ run: $(TRG) emu
 
 clean:
 	rm -f $(TRG) rom.lab rom.o65 rom-reloc.o65 rom.text rom.data reloc.lst
-	rm -f emu/jp6502emu boot/sd.img
+	rm -f emu/jp6502emu boot/sd.img $(JPAPPS)
 	rm -rf boot/sdcard
 

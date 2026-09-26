@@ -1,0 +1,141 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * The DS3231 on I2C as the clock of the ROM: fsfat32 (FSFAT32_CLOCK)
+ * gives the files it writes the time they were written, init
+ * (INIT_CLOCK) shows it when it boots.
+ *
+ *	clk_get		the time and date into clk_now, FAT encoded: time
+ *			low, high, date low, high; and the registers of the
+ *			clock, BCD, into clk_bcd: seconds, minutes, hours,
+ *			weekday, day, month, year. c=1 when the clock does
+ *			not answer or holds no date
+ *
+ * Without a module on the bus the W65C22S keeps the lines at the last
+ * level they had; the clock then seems to answer with zeros, which the
+ * check of the day and the month throws out. A DS3231 that has never been
+ * set counts from 2000-01-01; "date" sets it.
+ */
+
+	.(
+
+	.bss
+&clk_now .dsb 4
+bin	.dsb 7			/* clk_bcd in binary */
+	.text
+
+&clk_get .(
+	ldx #SEM_I2C
+	sec
+	jsr PSEM2
+	lda #0			; seconds, minutes, hours, weekday, day,
+	ldy #7			; month, year
+	jsr rtc_rd
+	php
+	ldx #SEM_I2C
+	jsr VSEM
+	plp
+	bcc ok
+err	rts
+bad	sec
+	rts
+
+ok	ldx #6			; BCD to binary, each within its range
+b	lda rtcbuf,x
+	and #$7f		; the century bit of the month
+	pha
+	and #$f0
+	lsr
+	lsr
+	lsr
+	sta i2cb		; twice the tens
+	pla
+	sec
+	sbc i2cb		; minus six times the tens
+	sbc i2cb
+	sbc i2cb
+	cmp max,x
+	bcs err
+	sta bin,x
+	dex
+	bpl b
+	lda bin+4		; day and month start at 1
+	beq bad
+	lda bin+5
+	beq bad
+
+	lda bin+1		; time: hhhhhmmm mmmsssss, seconds / 2
+	asl
+	asl
+	asl
+	asl
+	asl
+	sta clk_now
+	lda bin
+	lsr
+	ora clk_now
+	sta clk_now
+	lda bin+1
+	lsr
+	lsr
+	lsr
+	sta clk_now+1
+	lda bin+2
+	asl
+	asl
+	asl
+	ora clk_now+1
+	sta clk_now+1
+
+	lda bin+5		; date: yyyyyyym mmmddddd, years from 1980
+	asl
+	asl
+	asl
+	asl
+	asl
+	ora bin+4
+	sta clk_now+2
+	lda bin+5
+	lsr
+	lsr
+	lsr
+	sta clk_now+3
+	lda bin+6
+	clc
+	adc #20
+	asl
+	ora clk_now+3
+	sta clk_now+3
+	clc
+	rts
+
+	/* seconds, minutes, hours (24), weekday, day, month, year: above */
+max	.byt 60, 60, 24, 8, 32, 13, 100
+	.)
+
+#include "devices/i2c_jp.a65"
+
+&clk_bcd = rtcbuf
+
+	.)

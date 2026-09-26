@@ -9,3 +9,5 @@ boot/sd.img
 boot/sdcard/
 emu/jp6502emu
 emu/__pycache__/
+apps/date
+apps/i2cscan

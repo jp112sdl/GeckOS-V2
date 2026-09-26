@@ -286,9 +286,8 @@ done	lda #$ff
 reset	.(
 	lda #$ff
 	sta LDDR
-	lda VIA1+VIA_DDRA
-	ora #L_E | L_RW | L_RS
-	sta VIA1+VIA_DDRA
+	lda #L_E | L_RW | L_RS	; in one go - PA0/PA1 are the I2C bus
+	tsb VIA1+VIA_DDRA
 	lda #0
 	sta LCTRL
 	sta status

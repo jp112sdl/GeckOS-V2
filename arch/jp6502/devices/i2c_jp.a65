@@ -1,0 +1,210 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * I2C master on VIA1 port A of the JP6502, done by hand, and the
+ * register access of the DS3231 real time clock on it. Included by the
+ * clock of fsfat32 (rtc_jp.a65) and by the programs date and i2cscan.
+ *
+ * The lines are open drain (see jp6502def.i65): TSB and TRB on the DDR
+ * pull a line low or let it go, one instruction each, so another task
+ * that changes the other bits of the DDR in between does no harm. Who
+ * uses the bus holds SEM_I2C.
+ *
+ * At 4 MHz SCL is high for about 4 us and low for about 10 us - the
+ * DS3231 takes up to 400 kHz. The DS3231 does not stretch the clock.
+ *
+ * Include this behind the code that uses it: rtc_rd, rtc_wr, i2c_check
+ * and i2c_probe are only assembled when they are used (rtc_wr needs
+ * rtc_rd for rtcbuf).
+ *
+ *	rtc_rd		YR registers from register AC on into rtcbuf. c=1 if
+ *			the clock does not answer
+ *	rtc_wr		YR bytes from rtcbuf into the registers from AC on.
+ *			c=1 if the clock does not answer
+ *	i2c_check	c=1 if SCL or SDA does not go high by itself - no
+ *			pull-ups, so no module
+ *	i2c_probe	c=0 if a device answers at address AC
+ *	i2c_start, i2c_stop, i2c_put (AC; c=1 not acknowledged),
+ *	i2c_get (c=1: acknowledge, more to come; byte in AC)
+ *
+ * All of them keep XR and YR.
+ */
+
+#include "jp6502def.i65"
+
+#define	I2C_DDR		VIA1+VIA_DDRA
+#define	I2C_IN		VIA1+VIA_DRA
+
+	.bss
+i2cb	.byt 0
+	.text
+
+#iflused rtc_rd
+	.bss
+rtcbuf	.dsb 7
+	.text
+
+rtc_rd	.(
+	jsr rtc_ptr
+	bcs fail
+	jsr i2c_stop
+	jsr i2c_start
+	lda #RTC_ADDR*2+1	; read
+	jsr i2c_put
+	bcs fail
+	phx
+	ldx #0
+l	cpy #2			; c=1: more to come, acknowledge
+	jsr i2c_get
+	sta rtcbuf,x
+	inx
+	dey
+	bne l
+	plx
+	clc
+fail	jmp i2c_stop
+	.)
+#endif
+
+#iflused rtc_wr
+rtc_wr	.(
+	jsr rtc_ptr
+	bcs fail
+	phx
+	ldx #0
+l	lda rtcbuf,x
+	jsr i2c_put
+	bcs err
+	inx
+	dey
+	bne l
+err	plx
+fail	jmp i2c_stop
+	.)
+#endif
+
+#iflused i2c_check
+i2c_check .(
+	jsr i2c_start		; both lines low once,
+	jsr i2c_stop		; and let go again
+	lda I2C_IN
+	and #RTC_SCL | RTC_SDA
+	eor #RTC_SCL | RTC_SDA
+	cmp #1			; c=1: one stayed low
+	rts
+	.)
+#endif
+
+#iflused i2c_probe
+i2c_probe .(
+	asl			; write
+	pha
+	jsr i2c_start
+	pla
+	jsr i2c_put
+	jmp i2c_stop
+	.)
+#endif
+
+#iflused rtc_ptr
+	/* start, the clock's address, and AC as its register pointer */
+rtc_ptr	.(
+	pha
+	jsr i2c_start
+	lda #RTC_ADDR*2		; write
+	jsr i2c_put
+	pla
+	bcc i2c_put
+	rts
+	.)
+#endif
+
+	/* SDA goes low while SCL is high; leaves SCL low */
+i2c_start .(
+	lda #RTC_SDA
+	tsb I2C_DDR
+	lda #RTC_SCL
+	tsb I2C_DDR
+	rts
+	.)
+
+	/* SDA goes high while SCL is high; keeps c */
+i2c_stop .(
+	lda #RTC_SDA
+	tsb I2C_DDR
+	lda #RTC_SCL
+	trb I2C_DDR
+	lda #RTC_SDA
+	trb I2C_DDR
+	rts
+	.)
+
+	/* AC out, most significant bit first; c=1 if not acknowledged */
+i2c_put	.(
+	sec			; the 1 behind the last bit ends the loop
+	rol
+	sta i2cb
+l	lda #RTC_SDA
+	bcs one
+	tsb I2C_DDR		; 0: SDA low
+	bcc clk
+one	trb I2C_DDR		; 1: let it go
+clk	jsr i2c_clock
+	asl i2cb
+	bne l
+	lda #RTC_SDA		; let go, for the acknowledge
+	trb I2C_DDR
+	.)
+	/* falls through */
+
+	/* one clock; c = SDA while SCL was high */
+i2c_clock .(
+	lda #RTC_SCL
+	trb I2C_DDR
+	lda I2C_IN
+	and #RTC_SDA
+	cmp #RTC_SDA
+	lda #RTC_SCL
+	tsb I2C_DDR
+	rts
+	.)
+
+	/* a byte in, to AC; c=1 at entry: acknowledge it */
+i2c_get	.(
+	php
+	lda #RTC_SDA		; the slave has SDA
+	trb I2C_DDR
+	lda #1			; the 1 falls out after 8 bits
+	sta i2cb
+l	jsr i2c_clock
+	rol i2cb
+	bcc l
+	plp
+	bcc last
+	lda #RTC_SDA
+	tsb I2C_DDR
+last	jsr i2c_clock
+	lda i2cb
+	rts
+	.)

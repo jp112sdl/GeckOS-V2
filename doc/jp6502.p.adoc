@@ -8,8 +8,8 @@ jp6502 - describes the GeckOS port to the JP6502 board
 The JP6502 is a 65C02 computer built on Dawid Buchwald's DB6502: 32k RAM,
 24k of ROM, three 6522 VIAs, a 6551 ACIA to a USB serial chip, a TMS9918
 video display processor, a PS/2 keyboard behind a small controller, a
-20x4 LCD and an SD card slot. It has a single environment and no memory
-management unit.
+20x4 LCD and an SD card slot, and optionally a DS3231 real time clock.
+It has a single environment and no memory management unit.
 
 GeckOS runs from the ROM: kernel, lib6502, the device drivers, init and
 the filesystems are in the flash. The shell and all other programs are
@@ -23,7 +23,8 @@ loaded from a FAT32 formatted SD card.
 	$8400	R6551 ACIA, 19200 baud to the FT232R
 	$8800	VIA2 - SN76489 (port A, PB0-PB2), LED (PB7), D-pad,
 		speaker switch (CB2); the system timer
-	$9000	VIA1 - HD44780 LCD, 8 bit (port B, PA5-PA7)
+	$9000	VIA1 - HD44780 LCD, 8 bit (port B, PA5-PA7), DS3231 on
+		I2C (PA0 = SCL, PA1 = SDA)
 	$a000	24k ROM
 ----
 
@@ -80,7 +81,8 @@ The kernel starts from the reset vector. It clears the RAM - nothing else
 does on this board, and the .data segment of the ROM code is not loaded
 from anywhere - quiets all interrupt sources and the SN76489, and starts
 timer 1 of VIA2 as the system timer. Then the devices are registered,
-and init starts fsdev, fsfat32, and the shells.
+and init starts fsdev, fsfat32, and the shells. With a clock, init shows
+its time under its first line.
 
 The SN76489 is silenced first thing - it comes up playing whatever its
 registers hold - and gives a short beep: the board is starting.
@@ -163,6 +165,31 @@ and can be removed with *dot_clean* on the Mac.
 
 The card can be changed while no file is open on it.
 
+=== THE CLOCK
+A DS3231 module (the common ZS-042 and the like) goes on VIA1: SCL on
+PA0, SDA on PA1, VCC and GND. The module has the pull-ups. The lines are
+driven open drain, by switching the direction of the port bit, so
+nothing drives them high.
+
+With it, fsfat32 gives the files it writes the time they were written,
+see *FSFAT32_CLOCK* in *fsfat32(8)*, and init shows the time when the
+system boots. Without a module, or while it does not answer, files get
+2026-01-01 12:00, and there is no time at boot.
+
+The programs for it are on the card:
+
+date::
+	shows the time, *date 2026-09-26 14:30* (or *14:30:15*) sets it.
+	A clock that has been without power and battery says so.
+i2cscan::
+	lists the addresses that answer on the bus: a DS3231 module
+	shows $68, and $57 for the EEPROM on it. When SCL or SDA does not
+	go high by itself, there are no pull-ups - no module.
+
+The ZS-042 charges its battery through a resistor and a diode, meant for
+a rechargeable LIR2032. With a plain CR2032 remove the resistor (or the
+diode), or the cell may leak.
+
 == MEMORY MAP
 
 ----
@@ -185,7 +212,9 @@ About 23k are left for programs. Each running shell takes about 6k of
 that.
 
 == SYSTEM SEMAPHORES
-None besides the kernel's own.
+SEM_I2C (-6, in *jp6502def.i65*)::
+	held by whoever talks on the I2C bus: fsfat32 when it reads the
+	clock, date, i2cscan.
 
 == SUPPORTED DEVICES
 
@@ -201,7 +230,8 @@ nuldev::
 == TESTING
 *arch/jp6502/emu* holds an emulator of the board, written for this port:
 the 65C02, the three VIAs, the ACIA, the TMS9918 (without the picture),
-the keyboard controller, the LCD, and an SD card from an image file.
+the keyboard controller, the LCD, an SD card from an image file, and
+the DS3231 on I2C.
 
 ----
 make run		# serial line on the terminal, Ctrl-] quits
@@ -214,6 +244,9 @@ A script feeds the serial line ("ser ls\r") and the keyboard
 *-v* counts VDP accesses closer than 8 us, *-r* delivers serial input at
 the baud rate whether the CPU keeps up or not and counts the overruns,
 *-I* reports the longest time with interrupts off, *-P* profiles.
+The clock starts at the host's time, or at *-k "2026-09-26 14:30"*;
+*-K* gives a new one that never ran, *-R* none at all ("rtc" prints
+its time).
 *emu/fat32img.py* makes FAT32 card images and lists, reads and checks
 them.
 

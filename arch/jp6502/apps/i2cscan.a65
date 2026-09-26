@@ -1,0 +1,128 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * i2cscan - which addresses answer on the I2C bus of the JP6502 (VIA1
+ * PA0 = SCL, PA1 = SDA)
+ *
+ * It first lets go of both lines and checks that they go high: without
+ * pull-ups - no module plugged in - they do not, and every address would
+ * seem to answer. Then it addresses $08-$77 in turn, writing, and lists
+ * the ones that acknowledge. A DS3231 module shows $68, and $57 for the
+ * AT24C32 EEPROM most of them carry as well.
+ */
+
+#include "lib6502.i65"
+#include "kernel.i65"
+#include "kdefs.i65"
+#include "jp6502def.i65"
+
+main	.(
+	.bss
+addr	.byt 0
+nfound	.byt 0
+found	.dsb 112
+	.text
+
+	ldx #SEM_I2C
+	sec
+	jsr PSEM2
+	jsr i2c_check
+	bcc scan
+	ldx #SEM_I2C
+	jsr VSEM
+	lda #<nobus
+	ldy #>nobus
+	jsr strout
+	lda #E_CONFIG
+	rts
+
+scan	lda #0
+	sta nfound
+	lda #$08
+	sta addr
+l	jsr i2c_probe
+	bcs next
+	ldx nfound
+	lda addr
+	sta found,x
+	inc nfound
+next	inc addr
+	lda addr
+	cmp #$78
+	bcc l
+	ldx #SEM_I2C
+	jsr VSEM
+
+	lda nfound
+	bne some
+	lda #<none
+	ldy #>none
+	jsr strout
+	lda #0
+	rts
+
+some	lda #<head
+	ldy #>head
+	jsr strout
+	ldx #0
+d	stx addr		; now the index into found
+	lda #<indent
+	ldy #>indent
+	jsr strout
+	ldx addr
+	lda found,x
+	jsr hexout
+	ldx addr
+	lda found,x
+	cmp #RTC_ADDR
+	bne n1
+	lda #<ds3231
+	ldy #>ds3231
+	bne name
+n1	cmp #$57
+	bne eol
+	lda #<eeprom
+	ldy #>eeprom
+name	jsr strout
+eol	jsr crlfout
+	ldx addr
+	inx
+	cpx nfound
+	bcc d
+	lda #0
+	rts
+
+nobus	.asc "SCL or SDA does not go high: no pull-ups,", 13, 10
+	.asc "is the clock module plugged in?", 13, 10, 0
+none	.asc "no device answers on the I2C bus", 13, 10, 0
+head	.asc "devices on the I2C bus:", 13, 10, 0
+indent	.asc "  $", 0
+ds3231	.asc "  DS3231 clock", 0
+eeprom	.asc "  AT24C32 EEPROM (clock module)", 0
+
+#include "apps/common.a65"
+	.)
+
+	/* outside of main, whose labels would clash with its local ones */
+#include "devices/i2c_jp.a65"

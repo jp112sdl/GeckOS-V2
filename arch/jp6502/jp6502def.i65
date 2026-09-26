@@ -32,7 +32,8 @@
  *	$8800		VIA2	SN76489 sound (port A, PB0-PB2), LED (PB7),
  *				D-pad (PB3-PB6), speaker switch (CB2)
  *	$9000		VIA1	HD44780 LCD, 20x4, 8 bit (port B data,
- *				PA7=E, PA6=RW, PA5=RS)
+ *				PA7=E, PA6=RW, PA5=RS), DS3231 clock
+ *				(I2C, PA0=SCL, PA1=SDA)
  *	$a000-$ffff	24k ROM
  *
  * All three VIAs and the ACIA share the IRQ line.
@@ -90,6 +91,18 @@
 #define	BEEP_ERR_GAP_MS	100	/* the times at reset and for errors are
 				   rounded down to 20 ms, the others to
 				   the system tick */
+
+/*
+ * VIA1 port A - a DS3231 real time clock on I2C, with the pull-ups the
+ * usual modules carry. The lines are open drain: their port bits stay 0
+ * (the LCD writes only PA5-PA7), a DDR bit of 1 pulls the line low, 0
+ * lets it go high. SEM_I2C keeps two tasks - fsfat32 and date, say -
+ * from talking on the bus at the same time.
+ */
+#define	RTC_SCL		%00000001
+#define	RTC_SDA		%00000010
+#define	RTC_ADDR	$68		/* I2C address of the DS3231 */
+#define	SEM_I2C		<-6		/* a system semaphore nothing else uses */
 
 /* VIA3 port B - SD card */
 #define	SD_CS		%00000010

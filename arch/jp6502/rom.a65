@@ -116,6 +116,8 @@ ROMSTART=*
 #define	INIT_OUTDEV	1	/* boot messages on video1 */
 #define	INIT_BELL		/* one beep when all is started, three
 				   when something could not be */
+#define	INIT_CLOCK		/* the time of the DS3231 after the
+				   first line */
 #include  "sysapps/init/init.a65"
 
 #echo after INIT
@@ -132,6 +134,7 @@ ROMSTART=*
 /************* fsfat32 - the SD card			*/
 
 #define	FSFAT32_DEVICE	"devices/sd_jp.a65"
+#define	FSFAT32_CLOCK		/* the DS3231, see below */
 #define	FSFAT32_MAXFILE	3	/* 512 bytes of RAM each */
 #include  "sysapps/fs/fsfat32.a65"
 
@@ -186,6 +189,11 @@ end_auto
 
 #echo after LIB6502
 #print *
+
+	; ----------------------------------------------------------
+	; the DS3231 clock, for init and fsfat32
+
+#include  "devices/rtc_jp.a65"
 
 	; ----------------------------------------------------------
 	; kernel, up to the vectors at $fffa
