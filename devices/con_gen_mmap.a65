@@ -123,6 +123,19 @@
  */
  
 
+/*
+ * Consoles whose screen memory is not in the address space keep a copy
+ * of it in RAM and need to know what changed. CON_DIRTY_ROW is used after
+ * the line vzei points to has been written, CON_DIRTY_ALL after more than
+ * that. Both must keep all registers and flags.
+ */
+#ifndef CON_DIRTY_ROW
+#define	CON_DIRTY_ROW
+#endif
+#ifndef CON_DIRTY_ALL
+#define	CON_DIRTY_ALL
+#endif
+
 #ifdef CON_MMAP_COLOUR	
 FGCOL	=C64_TEXT_COL
 #else
@@ -329,6 +342,7 @@ doout	  ldy col
 	lda attrfg
 	sta (colptr),y          
 #endif
+	  CON_DIRTY_ROW
 &nextcol  ldy col
           iny
           cpy wr
@@ -439,6 +453,7 @@ su1c      lda (zei2),y
 #endif
           jmp su2
 su3
+	  CON_DIRTY_ALL
 	  ; clear line
           ldy wx
           lda #SCR_SPACE
@@ -519,7 +534,8 @@ su1c	lda (zei2),y
 #endif
         jmp su2     
 
-clr       ldy wx
+clr       CON_DIRTY_ALL
+	  ldy wx
           lda #SCR_SPACE
 su4       sta (vzei),y
           iny
@@ -681,6 +697,7 @@ c2ac	  sta (colptr),y
           inx
           cpx wh
           bcc c2b
+	  CON_DIRTY_ALL
           jsr clrli
 &&tohome  lda wx
           sta col
@@ -704,6 +721,7 @@ bslp      lda (vzei),y
           dey
           lda #SCR_SPACE
           sta (vzei),y
+	  CON_DIRTY_ROW
 &x4 c7    rts
           .)	;2
           .)	;1
@@ -783,6 +801,7 @@ td0       iny
 td1       dey
           lda #SCR_SPACE
           sta (vzei),y
+	  CON_DIRTY_ROW
           rts
           .)	;2
 
@@ -804,6 +823,7 @@ ticmp     dey
           bne ti1
           lda #SCR_SPACE
           sta (vzei),y
+	  CON_DIRTY_ROW
 tie       rts
           .)	;2
 
@@ -830,6 +850,7 @@ c         sta (vzei),y
           iny
           cpy wr
           bcc c
+	  CON_DIRTY_ROW
           rts
           .)	;2
           

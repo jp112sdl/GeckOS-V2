@@ -1,0 +1,259 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/***************************************************************************
+ *
+ * Kernel start for the JP6502 board.
+ *
+ * This file is included in the RESET routine of the kernel, after the
+ * "sei:cld". The board comes up from the ROM with nothing set up, so
+ * this is a cold start: stack, RAM, and every chip that could raise an
+ * interrupt or make a noise.
+ *
+ * The system timer is timer 1 of VIA2, free running. Nothing else on
+ * the board uses it; ACR bit 7 stays off, because PB7 of that VIA is
+ * the LED.
+ *
+ * It defines the macros the kernel expects from here:
+ *
+ * GETFREQ()		returns a=0 for 1Mhz, a=128 for 2MHz or more
+ * H_ERROR		blinks the LED as many times as the (negative)
+ *			error number in XR
+ * CHECKTIMER()		C=1 and timer interrupt cleared if it was the
+ *			system timer, C=0 otherwise
+ * SAVEMEM(), RESTOREMEM()	not needed without memory management
+ * STARTMEM()		ditto
+ */
+
+#include "jp6502def.i65"
+
+
+/*
+ * init stack pointer for system stack
+ */
+	  ldx #<-1
+	  txs
+
+/*
+ * First the SN76489: it comes up playing whatever its registers happen
+ * to hold. Silenced with the bytes of silence_all in the firmware
+ * (Software/common/source/sound.s).
+ *
+ * /WE is set high before port B of VIA2 becomes output, or switching
+ * the direction would already strobe a write. The stack is set, and the
+ * RAM is not cleared yet - but snsend needs nothing from it.
+ */
+	  .(
+	  lda #SN_WE		; /WE high, /CE low, LED off
+	  sta VIA2+VIA_DRB
+	  lda #LED_BIT | SN_WE | SN_CE
+	  sta VIA2+VIA_DDRB
+	  lda #$ff
+	  sta VIA2+VIA_DDRA
+	  ldx #0
+sl	  lda sntab,x
+	  jsr snsend		; in devices/snd_jp.a65
+	  inx
+	  cpx #7
+	  bcc sl
+	  jmp sndone
+sntab	  .byt $9f, $3f, $bf, $3f, $df, $3f, $ff	; all four volumes off
+sndone
+	  .)
+
+/*
+ * A short beep: the board is starting. The one at the end of the boot
+ * comes from init, through the console.
+ */
+	  lda #0		; the high tone
+	  jsr sntone
+	  lda #BEEP_START_MS / 20
+	  jsr delay
+	  jsr snquiet
+
+/*
+ * Clear the RAM. Nothing initializes it on this board, and the kernel,
+ * the devices and lib6502 all run from the ROM - their .data segment is
+ * not loaded, so everything in it starts out as the zero written here.
+ * The stack page is cleared too, nothing has been pushed yet.
+ */
+	  .(
+	  lda #0
+	  ldx #2
+zl	  sta 0,x
+	  inx
+	  bne zl
+	  stx 0		; x = 0
+	  ldy #1
+	  sty 1
+	  tay
+pl	  sta (0),y
+	  iny
+	  bne pl
+	  inc 1
+	  bpl pl	; up to and including $7fff
+	  sta 1
+	  .)
+
+/*
+ * Keep every interrupt source quiet until its driver takes it over.
+ */
+	  lda #$7f
+	  sta VIA1+VIA_IER
+	  sta VIA2+VIA_IER
+	  sta VIA3+VIA_IER
+	  sta VIA1+VIA_IFR
+	  sta VIA2+VIA_IFR
+	  sta VIA3+VIA_IFR
+	  lda #%00000010	; ACIA: DTR high - receiver and interrupts
+	  sta ACIABASE+ACIA_CMD	; off. Not a programmed reset: after one,
+				; the R6551 missed the next register writes
+
+
+/*
+ * the system timer
+ */
+	  lda #%01000000		; T1 free running, PB7 not touched
+	  sta VIA2+VIA_ACR
+	  lda #<TICK_LATCH
+	  sta VIA2+VIA_T1LL
+	  lda #>TICK_LATCH
+	  sta VIA2+VIA_T1CH		; loads the counter and starts it
+	  lda #%11000000		; T1 interrupt on
+	  sta VIA2+VIA_IER
+
+	  jmp kinit_end
+
+/*
+ * Three short beeps, then blink the LED -xr times, then pause - the
+ * kernel resets after that and ends up here again, so the signal
+ * repeats.
+ */
+hwerror	  .(
+	  txa
+	  pha
+	  ldx #3
+bp	  lda #1		; the low tone
+	  jsr sntone
+	  lda #BEEP_ERR_MS / 20
+	  jsr delay
+	  jsr snquiet
+	  lda #BEEP_ERR_GAP_MS / 20
+	  jsr delay
+	  dex
+	  bne bp
+	  pla
+	  eor #$ff
+	  tax
+	  inx			; number of blinks
+bl	  lda VIA2+VIA_DRB
+	  ora #LED_BIT
+	  sta VIA2+VIA_DRB
+	  lda #16
+	  jsr delay
+	  lda VIA2+VIA_DRB
+	  and #255-LED_BIT
+	  sta VIA2+VIA_DRB
+	  lda #16
+	  jsr delay
+	  dex
+	  bne bl
+	  lda #48
+	  jmp delay
+
+	  /* about AC * 20 ms, keeps XR; for the start and errors, the
+	     kernel is not running */
+&delay	  sta 1
+d0	  lda #CLOCK_MHZ*16
+	  sta 0
+d1	  ldy #0
+d2	  dey
+	  bne d2		; 256 * 5 cycles
+	  dec 0
+	  bne d1		; * 16 per MHz: 20 ms
+	  dec 1
+	  bne d0
+	  rts
+	  .)
+
+kinit_end
+
+/*
+ * originally SYSPORT specific
+ */
+#if CLOCK_MHZ > 1
+#define	GETFREQ()	lda #128
+#else
+#define	GETFREQ()	lda #0
+#endif
+
+/*
+ * display hardware errors on the LED
+ */
+#undef	LEDPORT
+#undef	LED_LED
+#define	H_ERROR		jsr hwerror
+
+/*
+ * Check for, and clear, the system timer interrupt. The flag is cleared
+ * only when it was set, so a timer that runs out between the two reads
+ * is not lost.
+ */
+#define CHECKTIMER()			.(		:\
+	lda VIA2+VIA_IFR			:\
+	asl					:\
+	asl		/* T1 flag into C */	:\
+	bcc notimer				:\
+	lda VIA2+VIA_T1CL	/* clears the flag */	:\
+notimer	.)
+
+/*
+ * The ACIA has no FIFO, and at 19200 baud the next byte comes after half
+ * a millisecond. Interrupts are off longer than that while the kernel
+ * switches tasks, so the byte is taken out first thing in every
+ * interrupt, into the ring of the serial device (devices/ser_jp.a65),
+ * which passes it on later. Reading the status clears its IRQ bit; the
+ * device does not look at that bit.
+ */
+#define	FASTIRQ()			.(	:\
+	lda ACIABASE+ACIA_SR			:\
+	and #%00001000		/* received a byte? */	:\
+	beq none				:\
+	ldx ser_rxw				:\
+	lda ACIABASE+ACIA_DR			:\
+	sta ser_rxbuf,x				:\
+	inx					:\
+	txa					:\
+	and #SER_RXBUFLEN-1			:\
+	cmp ser_rxr				:\
+	beq none		/* full: dropped */	:\
+	sta ser_rxw				:\
+none	.)
+
+/*
+ * no memory management
+ */
+#undef	SAVEMEM
+#undef	RESTOREMEM
+#define	STARTMEM()
+

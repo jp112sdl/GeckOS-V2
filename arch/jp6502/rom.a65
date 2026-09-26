@@ -1,0 +1,215 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/***************************************************************************/
+/*			These defines control the ROM build		   */
+/*									   */
+
+#define   ROM
+
+/* These are necessary for the JP6502 kernel *******************************/
+
+#define   NOMMU
+#define	  CMOSCPU		/* W65C02 */
+#undef    NMIDEV		/* nothing drives NMI on the board */
+#define	  OSA_CPU	"65C02"
+#define   OSA_ARCH	"JP6502"
+
+/* These are changeable ****************************************************/
+
+#define	STACKCOPY		/* if defined, save stack area in memory
+				   when context switching, otherwise divide
+				   stack area and give each task a part.
+				   It's faster without, but allows more
+				   tasks with */
+
+#define	NEED_CHECKCHLD		/* this is necessary if using "init" or
+				   lib6502 */
+#define	NEED_GETINFO
+#define	NEED_SETINFO
+#undef	NEED_SLOCK
+#define	NEED_RENICE
+
+#ifndef BOOTDRV
+#define	BOOTDRV		"b"	/* where are the boot files - the SD card */
+#endif
+#ifndef ROOTPATH
+#define	ROOTPATH	"b:"	/* where lsh chdirs into on boot */
+#endif
+
+/*
+ * Where init starts a shell: the VDP console and the serial line. Each
+ * one takes about 6k of the 23k of RAM that programs get; with only one
+ * of them there is room for bigger programs.
+ * "make SHELLS=-DNO_SERIAL_SHELL" or -DNO_VIDEO_SHELL.
+ */
+
+/*
+ * RAM layout:
+ *
+ *	$0002-$0007	kernel save areas
+ *	$0008-		zeropage of the ROM code, then zalloc'able
+ *	$0100		stack
+ *	$0200		PCBUF
+ *	$0300		.data, then .bss of the ROM code
+ *	Memstart	lib6502 malloc'able memory up to Memend
+ *	SCRBUF		the two virtual screens, 1k each
+ *	$8000		I/O
+ */
+#define	SCRBUF		$7800
+
+/***************************************************************************
+ *
+ * Here comes the ROM content
+ */
+
+#include  "config.i65"
+#include  "kdefs.i65"
+#include  "fdefs.i65"
+#include  "jp6502def.i65"
+#include  "kernel.i65"
+
+	.(
+
+	; ----------------------------------------------------------
+	; start of the init ROM chain, at $a000
+
+ROMSTART=*
+
+	; ----------------------------------------------------------
+	; here follow the entries in the init rom that are started
+	; by the kernel and the init process
+
+/************* devices	 				*/
+
+#include  "devices/devices.a65"
+
+#echo after DEVICES
+#print *
+
+/************* init process 				*/
+
+#define	INIT_VERBOSE
+#define	INIT_RESTART
+#define	INIT_MERGE
+#define	INIT_LIB6502
+#define	INIT_OUTDEV	1	/* boot messages on video1 */
+#define	INIT_BELL		/* one beep when all is started, three
+				   when something could not be */
+#include  "sysapps/init/init.a65"
+
+#echo after INIT
+#print *
+
+/************* fsdev - converts devices into files 	*/
+
+#define	FSDEV_NOROM		/* do not implement ROM disk drive (to save space) */
+#include  "sysapps/fs/fsdev.a65"
+
+#echo after FSDEV
+#print *
+
+/************* fsfat32 - the SD card			*/
+
+#define	FSFAT32_DEVICE	"devices/sd_jp.a65"
+#define	FSFAT32_MAXFILE	3	/* 512 bytes of RAM each */
+#include  "sysapps/fs/fsfat32.a65"
+
+#echo after FSFAT32
+#print *
+
+/************* boot lsh from BOOTDRV			*/
+
+#ifndef NO_SERIAL_SHELL
+	/* lsh on the serial line */
+	.(
+	.word end_auto
+	.byt PK_LIB+PK_AUTOEXEC+PK_RESTART	; is lib6502 program
+	.word 0		; P_ADDR ignored
+	.byt 16		; P_RAM
+	.byt 128	; P_SHARED
+	.byt 0		; P_PRIORITY
+	.byt 0,0	; P_DEV: ser1
+	.byt BOOTDRV,":lsh",0,"-d",0,ROOTPATH,0,0
+end_auto
+	.)
+#endif
+
+#ifndef NO_VIDEO_SHELL
+	/* and one on the first console - last, so that its prompt comes
+	   after the boot messages */
+	.(
+	.word end_auto
+	.byt PK_LIB+PK_AUTOEXEC+PK_RESTART	; is lib6502 program
+	.word 0		; P_ADDR ignored
+	.byt 16		; P_RAM
+	.byt 128	; P_SHARED
+	.byt 0		; P_PRIORITY
+	.byt 1,1	; P_DEV: video1
+	.byt BOOTDRV,":lsh",0,"-d",0,ROOTPATH,0,0
+end_auto
+	.)
+#endif
+
+/************* end of ROM executables			*/
+
+	.word -1
+
+	; ----------------------------------------------------------
+	; lib6502 code
+	;
+	; lib6502.a65 defines the LIB6502 label that is used for the
+	; relocation.
+
+#define	LIB6502_NONET
+#include  "lib6502/lib6502.a65"
+
+#echo after LIB6502
+#print *
+
+	; ----------------------------------------------------------
+	; kernel, up to the vectors at $fffa
+	;
+	; The kernel jump table defines the OSA2KERNEL label that is
+	; used for the relocation
+
+#define	EOK_NOFILL		/* the Makefile moves the vectors to $fffa */
+#include  "kernel/kernel.a65"
+
+	; ----------------------------------------------------------
+	; Constants for lib6502 memory handling
+
+	.bss
+	; the Makefile puts .bss right behind .data, and this is
+	; the end of it
+Memstart  =*
+	; end of allocatable memory (+1)
+Memend	  =SCRBUF
+
+	.zero
+	; start of zeropage allocatable area (up until $ff)
+Zerostart =*
+
+	.text
+	.)
+

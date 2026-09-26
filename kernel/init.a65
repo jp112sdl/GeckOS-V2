@@ -475,6 +475,12 @@ c2	jmp (tmp2)
           pha
 #endif
           cld
+#ifdef FASTIRQ
+	/* architecture specific work that cannot wait for the rest,
+	   like taking a byte out of a UART without a FIFO. AC and XR
+	   can be used. */
+	  FASTIRQ()
+#endif
           tsx
 
           lda $104,x

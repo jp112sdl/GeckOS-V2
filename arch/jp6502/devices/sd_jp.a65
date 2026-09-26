@@ -1,0 +1,419 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * Block driver for the SD card of the JP6502, for sysapps/fs/fsfat32.a65.
+ *
+ * The card sits on port B of VIA3, SPI done by hand: CS bit 1, SCK bit 2,
+ * MOSI bit 3, MISO bit 4 - the wiring Software/common/source/sd.s uses.
+ * Nothing else is on that port; the keyboard is on port A of the same
+ * VIA and its interrupt only reads port A, so this runs with interrupts
+ * on, in the filesystem task.
+ *
+ * A bit takes about 24 cycles, 6 us at 4 MHz - under the 400 kHz a card
+ * accepts before it is initialized, so there is no slow mode.
+ *
+ * The LED on VIA2 is on while a block is read or written.
+ *
+ * The time limits count bytes, which take longer the slower the clock;
+ * they are scaled with CLOCK_MHZ, so that they are about the same time
+ * at every clock: about 1.7 s for the card to come up (the card may
+ * take one), 0.2 s for a read (0.1 s allowed), 0.9 s for a write
+ * (0.5 s allowed).
+ *
+ * Interface:
+ *	blk_init	bring the card up. c=0 ok
+ *	blk_read	read the block number blk_lba (4 bytes, low byte first)
+ *			to (blk_ptr), 512 bytes. c=0 ok
+ *	blk_write	write (blk_ptr) to block blk_lba. c=0 ok
+ */
+
+#include "jp6502def.i65"
+
+#define	SDPORT	VIA3+VIA_DRB
+#define	SDDDR	VIA3+VIA_DDRB
+
+#define	SD_IDLE	SD_CS | SD_MOSI		/* deselected, SCK low */
+
+	.(
+
+	.zero
+&blk_ptr .word 0
+
+	.bss
+&blk_lba .dsb 4
+sd_hc	.byt 0		/* block addressing (SDHC/SDXC) */
+spib	.byt 0
+sdarg	.dsb 4		/* command argument, most significant byte first */
+sdcmd	.byt 0
+tmo	.word 0
+retry	.byt 0
+	.text
+
+/*
+ * clock a byte in with MOSI high, CS low; returns it in AC
+ * keeps YR
+ */
+spi_in	.(
+	phy
+	ldx #SD_MOSI
+	ldy #SD_MOSI | SD_SCK
+	lda #1
+	sta spib
+l	stx SDPORT
+	sty SDPORT
+	lda SDPORT
+	and #SD_MISO
+	cmp #SD_MISO
+	rol spib
+	bcc l
+	stx SDPORT		; leave SCK low
+	lda spib
+	ply
+	rts
+	.)
+
+/*
+ * clock AC out, CS low; keeps YR
+ */
+spi_out	.(
+	phy
+	sta spib
+	ldy #8
+l	lda #0
+	asl spib
+	bcc b0
+	lda #SD_MOSI
+b0	sta SDPORT
+	ora #SD_SCK
+	sta SDPORT
+	dey
+	bne l
+	and #255-SD_SCK
+	sta SDPORT
+	ply
+	rts
+	.)
+
+/*
+ * deselect, and eight more clocks so the card lets go of MISO
+ */
+sd_off	.(
+	pha
+	lda VIA2+VIA_DRB	; LED off
+	and #255-LED_BIT
+	sta VIA2+VIA_DRB
+	lda #SD_IDLE
+	sta SDPORT
+	ldx #16
+l	eor #SD_SCK
+	sta SDPORT
+	dex
+	bne l
+	pla
+	rts
+	.)
+
+/*
+ * send command AC with the argument in sdarg, return R1 in AC
+ * (bit 7 set: no answer)
+ */
+sd_cmd	.(
+	sta sdcmd
+	jsr spi_in		; one byte of clocks before, card selected
+	lda sdcmd
+	ora #$40
+	jsr spi_out
+	ldy #0
+a	lda sdarg,y
+	jsr spi_out
+	iny
+	cpy #4
+	bcc a
+	lda #$95		; CRC of CMD0; CMD8 gets its own below,
+	ldx sdcmd		; everything else is not checked
+	cpx #8
+	bne crc
+	lda #$87
+crc	jsr spi_out
+	ldy #10			; the answer comes within 8 bytes
+w	jsr spi_in
+	cmp #$ff
+	bne got
+	dey
+	bne w
+got	rts
+	.)
+
+	/* the same, with CMD number in XR (for the CRC) and argument zero */
+sd_cmd0	.(
+	lda #0
+	sta sdarg
+	sta sdarg+1
+	sta sdarg+2
+	sta sdarg+3
+	txa
+	jmp sd_cmd
+	.)
+
+/*
+ * bring the card up
+ */
+&blk_init .(
+	lda #SD_IDLE
+	sta SDPORT
+	lda #SD_CS | SD_SCK | SD_MOSI
+	sta SDDDR
+	lda #SD_IDLE		; 80 clocks with CS and MOSI high
+	ldx #160
+pre	eor #SD_SCK
+	sta SDPORT
+	dex
+	bne pre
+
+	lda #10			; CMD0 until the card is idle
+	sta retry
+c0	ldx #0
+	jsr sd_cmd0
+	cmp #1
+	beq idle
+	jsr sd_off
+	dec retry
+	bne c0
+	jmp fail
+
+idle	lda #0			; CMD8, "2.7-3.6V", check pattern $aa
+	sta sdarg
+	sta sdarg+1
+	lda #1
+	sta sdarg+2
+	lda #$aa
+	sta sdarg+3
+	lda #8
+	jsr sd_cmd
+	sta sd_hc		; 1: version 2 card, else version 1
+	and #4
+	bne v1			; illegal command: version 1
+	jsr spi_in		; the rest of R7
+	jsr spi_in
+	jsr spi_in
+	jsr spi_in
+v1
+	lda #<(500*CLOCK_MHZ)	; ACMD41 until it is ready
+	sta tmo
+	lda #>(500*CLOCK_MHZ)
+	sta tmo+1
+a41	ldx #55
+	jsr sd_cmd0
+	lda #0
+	sta sdarg+1
+	sta sdarg+2
+	sta sdarg+3
+	lda sd_hc
+	cmp #1
+	bne nohcs
+	lda #$40		; HCS: we can do block addressing
+nohcs	sta sdarg
+	lda #41
+	jsr sd_cmd
+	cmp #0
+	beq ready
+	jsr sd_off
+	lda tmo
+	bne t1
+	dec tmo+1
+t1	dec tmo
+	lda tmo
+	ora tmo+1
+	bne a41
+	jmp fail
+
+ready	lda #0
+	sta sd_hc
+	ldx #58			; read OCR, CCS tells the addressing
+	jsr sd_cmd0
+	cmp #0
+	bne nocss
+	jsr spi_in
+	and #$40
+	sta sd_hc
+	jsr spi_in
+	jsr spi_in
+	jsr spi_in
+nocss	lda sd_hc
+	bne hc
+	lda #0			; byte addressed: blocks of 512
+	sta sdarg
+	sta sdarg+1
+	lda #2
+	sta sdarg+2
+	lda #0
+	sta sdarg+3
+	lda #16
+	jsr sd_cmd
+hc	jsr sd_off
+	clc
+	rts
+
+fail	jsr sd_off
+	sec
+	rts
+	.)
+
+/*
+ * the argument for a block command, from blk_lba
+ */
+setarg	.(
+	lda VIA2+VIA_DRB	; LED on
+	ora #LED_BIT
+	sta VIA2+VIA_DRB
+	lda sd_hc
+	beq bytes
+	ldx #3
+	ldy #0
+l	lda blk_lba,x
+	sta sdarg,y
+	iny
+	dex
+	bpl l
+	rts
+bytes	lda #0			; times 512, for cards up to 2GB
+	sta sdarg+3
+	lda blk_lba
+	asl
+	sta sdarg+2
+	lda blk_lba+1
+	rol
+	sta sdarg+1
+	lda blk_lba+2
+	rol
+	sta sdarg
+	rts
+	.)
+
+&blk_read .(
+	jsr setarg
+	lda #17
+	jsr sd_cmd
+	cmp #0
+	bne fail
+	lda #0			; wait for the data token
+	sta tmo
+	lda #4*CLOCK_MHZ	; * 256 bytes
+	sta tmo+1
+w	jsr spi_in
+	cmp #$fe
+	beq data
+	cmp #$ff
+	bne fail
+	dec tmo
+	bne w
+	dec tmo+1
+	bne w
+	beq fail
+
+data	ldx #SD_MOSI
+	ldy #0
+	jsr rdhalf
+	inc blk_ptr+1
+	jsr rdhalf
+	dec blk_ptr+1
+	jsr spi_in		; CRC
+	jsr spi_in
+	jsr sd_off
+	clc
+	rts
+fail	jsr sd_off
+	sec
+	rts
+
+	/* 256 bytes to (blk_ptr),y, y=0 - the inner loop of spi_in */
+rdhalf	lda #1
+	sta spib
+b	stx SDPORT
+	lda #SD_MOSI | SD_SCK
+	sta SDPORT
+	lda SDPORT
+	and #SD_MISO
+	cmp #SD_MISO
+	rol spib
+	bcc b
+	lda spib
+	sta (blk_ptr),y
+	iny
+	bne rdhalf
+	stx SDPORT
+	rts
+	.)
+
+&blk_write .(
+	jsr setarg
+	lda #24
+	jsr sd_cmd
+	cmp #0
+	bne fail
+	lda #$ff
+	jsr spi_out
+	lda #$fe		; data token
+	jsr spi_out
+	ldy #0
+w1	lda (blk_ptr),y
+	jsr spi_out
+	iny
+	bne w1
+	inc blk_ptr+1
+w2	lda (blk_ptr),y
+	jsr spi_out
+	iny
+	bne w2
+	dec blk_ptr+1
+	lda #$ff		; CRC, not checked
+	jsr spi_out
+	lda #$ff
+	jsr spi_out
+	jsr spi_in		; data response
+	and #$1f
+	cmp #$05
+	bne fail
+	lda #0			; busy while it writes
+	sta tmo
+	lda #16*CLOCK_MHZ	; * 256 bytes
+	sta tmo+1
+busy	jsr spi_in
+	cmp #0
+	bne done
+	dec tmo
+	bne busy
+	dec tmo+1
+	bne busy
+	beq fail
+done	jsr sd_off
+	clc
+	rts
+fail	jsr sd_off
+	sec
+	rts
+	.)
+
+	.)
+

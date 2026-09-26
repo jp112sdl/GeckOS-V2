@@ -84,4 +84,14 @@ csa65: clean
 runcsa65: csa65
 	(cd arch/csa65/boot; $(XCSA))
 
+##########
+
+jp6502:
+	(cd apps; ${MAKE};)
+	(cd sysapps; ${MAKE};)
+	(cd arch/jp6502; ${MAKE}; ${MAKE} sdcard)
+
+runjp6502: jp6502
+	(cd arch/jp6502; ${MAKE} run)
+
 

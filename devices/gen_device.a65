@@ -107,6 +107,25 @@ nocheck	rts
 	  ; generic reset
 	  cpx #MAX_DEVICE
 	  bcs max_err
+
+	  ; An interrupt can come in while the console is at work (see
+	  ; dev_timer). The calls it makes must not leave curdev changed.
+	  cmp #DC_TIMER
+	  beq intr
+	  cmp #DC_IRQ
+	  bne nointr
+intr	  tay
+	  lda curdev
+	  pha
+	  tya
+	  stx curdev
+	  jsr p1
+	  tay
+	  pla
+	  sta curdev
+	  tya
+	  rts
+nointr
 	  stx curdev
 
           cmp #DC_RES

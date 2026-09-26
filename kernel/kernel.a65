@@ -42,6 +42,7 @@
 /*                  errors						  */
 /*	CHECKTIMER  clear the irq line from the kernel timer signal	  */
 /*                  and return if it was kernel timer interrupt in C      */
+/*	FASTIRQ	    optional, runs first thing in the interrupt routine	  */
 /*									  */
 /**************************************************************************/
 

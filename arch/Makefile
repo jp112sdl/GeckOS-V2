@@ -1,5 +1,5 @@
 
-# archdirs= c64 csa65 gecko embedded proto cbm8x96 pet32k
+# archdirs= c64 csa65 gecko embedded proto cbm8x96 pet32k jp6502
 
 clean:
 	(for i in *; do \

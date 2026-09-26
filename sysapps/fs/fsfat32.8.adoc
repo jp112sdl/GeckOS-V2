@@ -1,0 +1,86 @@
+= FSFAT32(8)
+:doctype: manpage
+
+== NAME
+fsfat32 - filesystem driver for FAT32 media
+
+== SYNOPSIS
+*fsfat32*
+
+== DESCRIPTION
+fsfat32 registers one drive, a FAT32 filesystem on a medium with 512
+byte blocks. It reaches the medium through a block driver that is
+included at build time; the JP6502 port uses it for its SD card
+(arch/jp6502/devices/sd_jp.a65).
+
+The filesystem either covers the whole medium, or is the first FAT32
+partition (type $0b or $0c) of an MBR partition table.
+
+Supported are
+
+* FS_OPEN_RD - read a file
+* FS_OPEN_WR, FS_OPEN_OW - write a file; an existing one is truncated
+* FS_OPEN_AP - append to a file, create it if it does not exist
+* FS_OPEN_DR - read a directory. The last part of the name may contain
+  the wildcards "*" and "?"; a "*" in the name part alone also matches
+  any extension. A name without wildcards that is a directory lists
+  that directory.
+* FS_DELETE - delete a file
+* FS_RENAME - rename a file or directory. The first name is the old one,
+  the second the new one, of which only the last part counts: the entry
+  stays in its directory.
+* FS_MKDIR, FS_RMDIR - make and remove directories; only empty ones can
+  be removed.
+
+Names are 8.3, and upper and lower case are the same. Directories show
+them in lower case. Long file names are ignored - the files are still
+there under their short name - and are not written. When a file is
+deleted or renamed, the long name entries in front of it are removed
+too, as long as they are in the same sector.
+
+Hidden entries, volume labels, "." and ".." are not listed.
+
+The free space in the directory listing comes from the FSInfo sector.
+It is kept up to date when fsfat32 writes; when the FSInfo sector does
+not know it, the free space is not listed.
+
+There is no clock; created and written files get the date and time
+FSFAT32_DATE and FSFAT32_TIME.
+
+The medium can be changed while no file is open: every request that
+finds no file open reads the boot sector again, and mounts the medium
+again when its serial number changed, or when it cannot be read.
+
+== BLOCK DRIVER
+The file named by FSFAT32_DEVICE is included into fsfat32 and has to
+provide:
+
+blk_init::
+	make the medium ready, c=0 when it is there
+blk_read::
+	read the block with number blk_lba (4 bytes, low byte first) to
+	(blk_ptr), 512 bytes, c=0 when it worked
+blk_write::
+	write the 512 bytes at (blk_ptr) to block blk_lba
+blk_lba, blk_ptr::
+	the block number, and a zeropage pointer
+
+== BUILD OPTIONS
+
+ROM::
+	if set, include boot ROM header
+FSFAT32_DEVICE::
+	file name of the block driver
+FSFAT32_MAXFILE::
+	number of files that can be open at the same time, 4 if not set;
+	each one takes 512 bytes of buffer
+FSFAT32_DATE, FSFAT32_TIME::
+	date and time for written files, in FAT encoding
+
+== SEE ALSO
+link:../../doc/jp6502.p.adoc[jp6502(p)],
+link:fsdev.8.adoc[fsdev(8)]
+
+== REPORTING BUGS
+
+Please report bugs at https://github.com/fachat/GeckOS-V2/issues

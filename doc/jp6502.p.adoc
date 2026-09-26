@@ -1,0 +1,224 @@
+= JP6502(P)
+:doctype: manpage
+
+== NAME
+jp6502 - describes the GeckOS port to the JP6502 board
+
+== DESCRIPTION
+The JP6502 is a 65C02 computer built on Dawid Buchwald's DB6502: 32k RAM,
+24k of ROM, three 6522 VIAs, a 6551 ACIA to a USB serial chip, a TMS9918
+video display processor, a PS/2 keyboard behind a small controller, a
+20x4 LCD and an SD card slot. It has a single environment and no memory
+management unit.
+
+GeckOS runs from the ROM: kernel, lib6502, the device drivers, init and
+the filesystems are in the flash. The shell and all other programs are
+loaded from a FAT32 formatted SD card.
+
+----
+	CPU	W65C02, 4 MHz (1, 2 and 8 MHz can be built)
+	$0000	32k RAM
+	$8080	TMS9918 (VRAM at $8080, registers at $8081)
+	$8200	VIA3 - keyboard controller (port A, CA1/CA2), SD card (port B)
+	$8400	R6551 ACIA, 19200 baud to the FT232R
+	$8800	VIA2 - SN76489 (port A, PB0-PB2), LED (PB7), D-pad; the
+		system timer
+	$9000	VIA1 - HD44780 LCD, 8 bit (port B, PA5-PA7)
+	$a000	24k ROM
+----
+
+== QUICKSTART
+In *arch/jp6502*:
+
+----
+make			# the ROM image, boot/geckos.bin
+make sdcard		# the programs for the card, in boot/sdcard
+make run		# both in the emulator, serial line on the terminal
+----
+
+Flash the image with the flash tool of the JP6502 repository:
+
+----
+FlashPROMv2/tools/flashtool.py write GeckOS-V2/arch/jp6502/boot/geckos.bin
+----
+
+Copy the files from *boot/sdcard* into the root directory of an SD card
+with a FAT32 filesystem and put it into the slot. After a reset the LCD
+shows "GeckOS/A65 2.2", init reports on the screen what it starts, and
+there is a shell prompt ("#") on the screen and on the serial line.
+
+== BUILDING
+The 6502 cross assembler 'xa' (xa65) in version 2.4.1 or later is needed,
+with 'file65' and 'reloc65' that come with it. The programs for the card
+are built by the Makefiles in *apps* and *sysapps*; *make sdcard* runs
+them.
+
+The image is 32k, like the other ROMs of the board: $8000-$9fff is I/O
+and filled with $ea, $a000-$ffff is GeckOS. The build fails when the
+ROM does not fit, and reports how much is free.
+
+=== BUILD OPTIONS
+
+CLOCK::
+	*make CLOCK=2* builds for a 2 MHz clock, 1, 4 (the default) and
+	8 are possible too. The clock sets the system timer, which counts
+	the CPU clock, and the pacing of the VDP accesses. The system tick
+	is 100 Hz at 2 and 4 MHz, 50 Hz at 1 MHz and 125 Hz at 8 MHz.
+	Below 4 MHz the serial line cannot take pasted text, see below.
+
+SHELLS::
+	By default init starts a shell on the VDP console and one on the
+	serial line. *make SHELLS=-DNO_SERIAL_SHELL* or
+	*-DNO_VIDEO_SHELL* leaves one of them out, which leaves about 6k
+	more RAM for programs.
+
+In *rom.a65*, BOOTDRV and ROOTPATH give where the shell is loaded from
+and where it starts ("b:").
+
+== BOOTING
+The kernel starts from the reset vector. It clears the RAM - nothing else
+does on this board, and the .data segment of the ROM code is not loaded
+from anywhere - quiets all interrupt sources and the SN76489, and starts
+timer 1 of VIA2 as the system timer. Then the devices are registered,
+and init starts fsdev, fsfat32, and the shells.
+
+The SN76489 is silenced first thing - it comes up playing whatever its
+registers hold - and gives a short beep: the board is starting.
+
+When everything is started, init sends a bell to the console: one short
+beep. When something could not be started - most likely the shell,
+because there is no card in the slot - there are three, and the reason
+is on the screen.
+
+When the kernel itself cannot start, there are three short low beeps,
+then the LED on VIA2 blinks the error number (see *startup(7)*), and the
+system resets.
+
+== USAGE
+
+=== CONSOLES
+The VDP shows two virtual consoles in 40x24 text mode, white on dark
+blue, with the character set of the board's firmware. Page Up switches
+between them. The screen is kept in RAM and copied to the VDP when it
+changed, at every system tick; the VDP gets 8 us between two accesses,
+as the board's firmware does.
+
+The bell (^G) is a short beep on the SN76489. Bells that come faster
+than they can be played are played one after the other.
+
+The keyboard controller sends characters in the German layout. Ctrl-C
+sends a break to the foreground program, Page Down (which the controller
+sends as ^Z) suspends it. Backspace works as expected, the arrow keys are
+sent as the console cursor codes 128-131, which the shell ignores.
+
+=== SERIAL LINE
+*ser1* is the ACIA at 19200 baud, 8N1, no handshake - the board does not
+wire it. Ctrl-C and Ctrl-Z work as on the console, DEL (what terminal
+programs send for Backspace) is turned into BS.
+
+The ACIA holds a single received byte, and at 19200 baud the next one
+follows after half a millisecond. So the byte is taken out first thing
+in every interrupt (*FASTIRQ* in kernel/kinit.a65, a hook at the start
+of the kernel's interrupt routine) into a 64 byte ring, and the longer
+jobs the kernel does with interrupts off are opened up: the console
+work (*CONSOLE_INTERRUPTIBLE*), copying the stacks when switching
+tasks, and passing the received bytes on. At 4 MHz interrupts are then
+never off for more than about 0.4 ms, and text pasted into a terminal
+arrives complete as long as the program reading it keeps up (the ring
+takes 64 bytes). At 1 and 2 MHz the kernel is too slow for 19200 baud;
+fast typing still works, pasting loses characters.
+
+=== LCD
+*lcd* is an output only device. It wraps and scrolls, and knows CR, LF,
+BS and FF (clear):
+
+----
+echo hallo > a:lcd
+----
+
+=== DRIVES
+*a:* is fsdev, the devices as files (a:ser1, a:video1, a:video2, a:lcd,
+a:nuldev). *b:* is the SD card, see *fsfat32(8)*.
+
+The shell loads programs from its current directory, so with the
+programs in the root directory of the card, commands have to be given
+with their path ("/ls") from anywhere else - or *cd /* first.
+
+=== THE SD CARD
+The card has to have a FAT32 filesystem, either on the whole card or
+in the first FAT32 partition of an MBR partition table. Cards of 4 to 32
+GB as they come, or formatted with the SD association's formatter, are
+fine. Only 8.3 names are used; long names are not shown, but files with
+long names can be read by their 8.3 name. The LED is on while the card
+is read or written.
+
+macOS adds "._" files for its metadata to FAT cards. They are hidden,
+and can be removed with *dot_clean* on the Mac.
+
+The card can be changed while no file is open on it.
+
+== MEMORY MAP
+
+----
+	$0002		ENVSAVE pointer (per environment)
+	$0004		TASKSAVE pointer (per tasks)
+	$0006		THREADSAVE pointer (per thread)
+	$0008		zeropage of the ROM code, then zalloc'able
+	$0100		stack, system and task part (STACKCOPY)
+	$0200		PCBUF communication buffer
+	$0300		.data, then .bss of the ROM code
+	about $1a00	start of malloc'able memory
+	$7800		screen buffers of the two consoles, 1k each
+	$8000		I/O
+	$a000		ROM: init ROM chain (devices, init, fsdev, fsfat32,
+			shell entries), lib6502, kernel
+	$fffa		vectors
+----
+
+About 23k are left for programs. Each running shell takes about 6k of
+that.
+
+== SYSTEM SEMAPHORES
+None besides the kernel's own.
+
+== SUPPORTED DEVICES
+
+ser1::
+	the ACIA
+video1, video2::
+	the VDP consoles
+lcd::
+	the LCD
+nuldev::
+	discards what is written, gives EOF when read
+
+== TESTING
+*arch/jp6502/emu* holds an emulator of the board, written for this port:
+the 65C02, the three VIAs, the ACIA, the TMS9918 (without the picture),
+the keyboard controller, the LCD, and an SD card from an image file.
+
+----
+make run		# serial line on the terminal, Ctrl-] quits
+emu/jp6502emu -s boot/sd.img -x script boot/geckos.bin
+----
+
+A script feeds the serial line ("ser ls\r") and the keyboard
+("kbd ..."), waits for output ("until #"), and prints the VDP screen
+("screen") or the LCD ("lcd"); *jp6502emu.c* describes the commands.
+*-v* counts VDP accesses closer than 8 us, *-r* delivers serial input at
+the baud rate whether the CPU keeps up or not and counts the overruns,
+*-I* reports the longest time with interrupts off, *-P* profiles.
+*emu/fat32img.py* makes FAT32 card images and lists, reads and checks
+them.
+
+== SEE ALSO
+link:../sysapps/fs/fsfat32.8.adoc[fsfat32(8)],
+link:startup.7.adoc[startup(7)],
+link:devices.7.adoc[devices(7)],
+link:porting.7.adoc[porting(7)]
+
+== AUTHOR
+Port to the JP6502 based on the work of André Fachat.
+
+== REPORTING BUGS
+Please report bugs at https://github.com/fachat/GeckOS-V2/issues

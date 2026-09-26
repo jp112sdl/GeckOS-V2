@@ -122,6 +122,7 @@ For current ports, please look at
 * link:cbm8x96.p.adoc[cbm8x96]
 * link:c128.p.adoc[c128]
 * link:csa65.p.adoc[CS/A65] (my self-built computer with MMU)
+* link:jp6502.p.adoc[JP6502] (a DB6502 based board, runs from ROM with an SD card)
 
 == Development
 For the development of OS/A65 programs there are two possibilities:

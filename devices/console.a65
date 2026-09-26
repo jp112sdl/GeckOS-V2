@@ -136,9 +136,16 @@ dev_timer .(	;2
           dec syscnt	/* signal that devices is interrupted */
           cli
 
+#ifdef CONSOLE_INTERRUPTIBLE
+	/* The whole console work runs with interrupts on. Scrolling a
+	   screen held in RAM takes milliseconds, which a serial line
+	   cannot wait for. The console itself is not entered again
+	   (syscnt), and gen_dev keeps curdev over interrupts. */
+#else
 	nop
 	nop
 	sei
+#endif
 	  jsr do_irq
 
           sei

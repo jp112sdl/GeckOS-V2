@@ -1,0 +1,11 @@
+rom.o65
+rom-reloc.o65
+rom.lab
+rom.text
+rom.data
+reloc.lst
+boot/geckos.bin
+boot/sd.img
+boot/sdcard/
+emu/jp6502emu
+emu/__pycache__/

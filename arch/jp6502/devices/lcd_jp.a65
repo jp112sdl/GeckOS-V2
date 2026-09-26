@@ -1,0 +1,339 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * "lcd" - the 20x4 HD44780 panel of the JP6502, output only.
+ *
+ * 8 bit interface: data on port B of VIA1, E on PA7, RW on PA6, RS on
+ * PA5, as in Software/common/source/lcd8bit.s. Text wraps at the end of
+ * a line and scrolls up at the bottom; CR, LF, FF (clear) and BS work,
+ * other control codes are ignored.
+ *
+ * It shows the system name when it is reset, so the panel tells that
+ * GeckOS is up. "echo hallo > a:lcd" writes to it.
+ *
+ * The busy flag is polled with a time limit, so a panel that is missing
+ * or does not answer slows the output down but does not stop the system.
+ */
+
+#include "jp6502def.i65"
+
+#define	LDATA	VIA1+VIA_DRB
+#define	LDDR	VIA1+VIA_DDRB
+#define	LCTRL	VIA1+VIA_DRA
+#define	L_E	%10000000
+#define	L_RW	%01000000
+#define	L_RS	%00100000
+
+	.(
+	.word devend
+	jmp prg
+	.asc "lcd",0
+
+	.bss
+status	.byt 0
+instr	.byt 0
+col	.byt 0
+row	.byt 0
+cnt	.byt 0
+tmo	.byt 0
+sx	.byt 0
+sy	.byt 0
+lbuf	.dsb 80
+	.text
+
+prg	cmp #DC_TIMER
+	beq timer
+	cmp #DC_RES
+	bne p0
+	jmp reset
+p0	cmp #DC_GS
+	bne p1
+	lda status
+	bne devon
+	sty instr
+	beq ok
+p1	cmp #DC_TX_ON
+	bne p2
+	lda #DC_SW_TX
+	sta status
+	bne ok
+p2	cmp #DC_TX_OFF
+	beq txoff
+	cmp #DC_EXIT
+	beq txoff
+	cmp #DC_IRQ
+	beq noirq
+	cmp #DC_ST
+	beq ok
+	lda #E_NOTIMP
+	.byt $2c
+devon	lda #E_DON
+	.byt $2c
+devoff	lda #E_DOFF
+	.byt $2c
+ok	lda #E_OK
+	cmp #1
+	rts
+
+txoff	lda status
+	beq devoff
+	ldx instr
+	lda #SC_NUL
+	jsr STRCMD
+	lda #0
+	sta status
+	beq ok
+
+	/* up to 20 characters per tick */
+timer	.(
+	lda status
+	beq noirq
+	lda #20
+	sta cnt
+l	ldx instr
+	jsr GETC
+	bcs empty
+	jsr putch
+	dec cnt
+	bne l
+	beq noirq
+empty	cmp #E_EOF
+	bne noirq
+	jsr txoff
+	.)
+noirq	lda #E_NOIRQ
+	rts
+
+/*
+ * print AC
+ */
+putch	.(
+	cmp #13
+	beq cr
+	cmp #10
+	beq lf
+	cmp #12
+	bne n12
+	jmp clear
+n12	cmp #8
+	beq bs
+	cmp #32
+	bcc ret
+	ldx col
+	cpx #20
+	bcc in
+	pha
+	jsr lf
+	pla
+in	pha
+	ldx row
+	lda rowoff,x
+	clc
+	adc col
+	tax
+	pla
+	sta lbuf,x
+	jsr ldata
+	inc col
+ret	rts
+
+bs	lda col
+	beq ret
+	dec col
+	jmp setpos
+
+cr	lda #0
+	sta col
+	jmp setpos
+
+lf	lda #0
+	sta col
+	lda row
+	cmp #3
+	bcs scroll
+	inc row
+	jmp setpos
+
+scroll	ldx #0			; everything a line up
+s1	lda lbuf+20,x
+	sta lbuf,x
+	inx
+	cpx #60
+	bcc s1
+	lda #" "
+s2	sta lbuf,x
+	inx
+	cpx #80
+	bcc s2
+	ldy #0			; and all of it to the panel
+s3	sty row
+	jsr setpos
+	ldx row
+	lda rowoff,x
+	tax
+	ldy #20
+s4	lda lbuf,x
+	stx sx
+	jsr ldata
+	ldx sx
+	inx
+	dey
+	bne s4
+	ldy row
+	iny
+	cpy #4
+	bcc s3
+	lda #3
+	sta row
+	jmp setpos
+	.)
+
+clear	.(
+	lda #1
+	jsr lcmd
+	lda #0
+	sta col
+	sta row
+	ldx #79
+	lda #" "
+l	sta lbuf,x
+	dex
+	bpl l
+	rts
+	.)
+
+	/* DDRAM address of col/row */
+setpos	.(
+	ldx row
+	lda ddram,x
+	clc
+	adc col
+	ora #$80
+	jmp lcmd
+	.)
+
+rowoff	.byt 0, 20, 40, 60
+ddram	.byt $00, $40, $14, $54
+
+/*
+ * the panel itself
+ */
+lcmd	ldx #0
+	.byt $2c
+ldata	ldx #L_RS
+	.(
+	pha
+	jsr lwait
+	pla
+	sta LDATA
+	stx LCTRL
+	txa
+	ora #L_E
+	sta LCTRL
+	stx LCTRL
+	rts
+	.)
+
+	/* wait while the busy flag is set, keeps XR and YR */
+lwait	.(
+	phy
+	lda #0
+	sta LDDR
+	lda #L_RW
+	sta LCTRL
+	lda #8
+	sta tmo
+	ldy #0
+l	lda #L_RW | L_E
+	sta LCTRL
+	lda LDATA		; a microsecond after E, the panel wants 360 ns
+	pha
+	lda #L_RW
+	sta LCTRL
+	pla
+	bpl done
+	dey
+	bne l
+	dec tmo
+	bne l
+done	lda #$ff
+	sta LDDR
+	ply
+	rts
+	.)
+
+reset	.(
+	lda #$ff
+	sta LDDR
+	lda VIA1+VIA_DDRA
+	ora #L_E | L_RW | L_RS
+	sta VIA1+VIA_DDRA
+	lda #0
+	sta LCTRL
+	sta status
+	; the power-on sequence: function set three times, with pauses,
+	; before the busy flag can be trusted
+	ldx #3
+f	jsr pause
+	lda #$38		; 8 bit, 2 lines, 5x8
+	sta LDATA
+	lda #L_E
+	sta LCTRL
+	lda #0
+	sta LCTRL
+	dex
+	bne f
+	lda #$38
+	jsr lcmd
+	lda #$0c		; display on, no cursor
+	jsr lcmd
+	lda #$06		; entry mode: increment
+	jsr lcmd
+	jsr clear
+	ldy #0
+b	lda banner,y
+	beq e
+	sty sy
+	jsr putch
+	ldy sy
+	iny
+	bne b
+e	clc
+	rts
+
+	/* about 5 ms */
+pause	lda #CLOCK_MHZ*4
+	sta tmo
+	ldy #0
+p	dey
+	bne p
+	dec tmo
+	bne p
+	rts
+
+banner	.asc "GeckOS/A65 2.2", 13, 10, "JP6502", 0
+	.)
+
+devend	.)
+

@@ -1,0 +1,558 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * Console of the JP6502: the TMS9918 in 40x24 text mode, and the PS/2
+ * keyboard behind its controller on VIA3.
+ *
+ * The video memory of the TMS9918 is not in the address space, so the
+ * generic memory mapped console (devices/con_gen_mmap.a65) works on
+ * a shadow copy of each virtual screen in RAM, 1k apart from SCRBUF on.
+ * It reports which part of a screen it has changed (CON_DIRTY_ROW,
+ * CON_DIRTY_ALL); at the end of every console tick the changed part of
+ * the visible screen is copied into the name table. Switching screens
+ * copies all of it.
+ *
+ * The chip wants 8 us between two accesses, like the firmware assumes
+ * (Software/common/source/vdp.s). A whole screen then takes about 10 ms,
+ * and scrolling the copy in RAM about 3 ms at 4 MHz, so the console runs
+ * with interrupts enabled (CONSOLE_INTERRUPTIBLE) - the ACIA has a single
+ * byte receive buffer, at 19200 baud a character comes every half
+ * millisecond.
+ *
+ * The keyboard controller sends characters, already mapped to the German
+ * layout. It gives no scan codes and no function keys, so the console
+ * switch key is Page Up, and Page Down arrives as ^Z, which suspends the
+ * foreground process. DEL (the Backspace key) is passed on as BS, the
+ * arrow keys as the cursor codes 128-131.
+ *
+ * The bell (^G) is a short beep on the SN76489; bells that come faster
+ * than they can be played are played one after the other.
+ */
+
+#include "jp6502def.i65"
+
+#define	CONSOLE_INTERRUPTIBLE
+
+#define	MAX_SCREEN	2		/* number of virtual consoles */
+
+#ifndef SCRBUF
+#echo SCRBUF must be defined, 1k aligned
+#endif
+
+#define	SET_MMU
+#define	BELLIRQ		jsr vflush:jsr bellirq
+#define	TRIGBELL	jsr trigbell
+
+#define	MAXSPAL		#40
+#define	MAXZEIL		#24
+
+#define	SWITCHKEY	$19		/* Page Up */
+#define	SWITCHNOSHIFT
+
+#define	CRSR_BLINK	TICK_HZ*3/10	/* ticks per cursor phase */
+
+					/* screen# -> nothing needed */
+#define	HI_VID
+					/* hi byte of the screen buffer of curdev */
+#define	ACT_HI_VID	lda curdev:asl:asl:clc:adc #>SCRBUF
+
+#define	SCR_SPACE	" "
+					/* bit 7 is inverse, the font is ASCII */
+#define	ASC2SCR		and #$7f
+#define	SCR2ASC		and #$7f
+
+#define	DO_IRQ
+
+#define	CON_DIRTY_ROW	jsr vdirty_row
+#define	CON_DIRTY_ALL	jsr vdirty_all
+
+/*
+ * the generic part goes first, so that its zeropage labels are known
+ * when the code below uses them
+ */
+#include "devices/con_gen_mmap.a65"
+
+/* VDP memory layout, as in the firmware */
+#define	VDP_NAMETAB	$0000
+#define	VDP_PATTAB	$0800
+
+/*
+ * Pacing of the VDP accesses: vdelay makes up 8 us after an access that
+ * is followed by little else, vdelayl the remainder in the copy loop,
+ * which takes 14 cycles on its own. A jsr/rts pair is 12.
+ */
+#if CLOCK_MHZ > 2
+#define	VD_LOOP		(8*CLOCK_MHZ-25)/2
+#define	VD_EXTRA	7
+#else
+#if CLOCK_MHZ > 1
+#define	VD_LOOP		0
+#define	VD_EXTRA	2
+#else
+#define	VD_LOOP		0
+#define	VD_EXTRA	0
+#endif
+#endif
+
+	.zero
+vp	.word 0
+	.data
+dlo	.word 0		/* changed range of the visible screen, */
+dhi	.word 0		/* offsets into it; dlo > dhi is clean */
+vtmp	.word 0
+vcnt	.word 0
+kbw	.byt 0		/* keyboard ring */
+kbr	.byt 0
+kbuf	.dsb 16
+crsrfl	.byt 0
+crsrcnt	.byt 0
+bellq	.byt 0		/* bells still to play */
+bellt	.byt 0		/* ticks left of the tone or the pause */
+bellon	.byt 0		/* tone is on */
+	.text
+
+#define	BELL_TONE	(TICK_HZ * BEEP_BELL_MS / 1000)	/* in ticks */
+#define	BELL_PAUSE	(TICK_HZ * BEEP_GAP_MS / 1000)
+
+&console_init .(
+	jsr inivdp
+	jsr inikbd
+	lda #0
+	sta crsrfl
+	sta crsrcnt
+	rts
+	.)
+
+/**************************************************************************
+ * the TMS9918
+ */
+
+vdelay	.dsb VD_EXTRA, $ea
+vdelayl	.dsb VD_LOOP, $ea
+	rts
+
+	/* ac = value, xr = register */
+vreg	.(
+	sta VDP_REG
+	jsr vdelay
+	txa
+	ora #$80
+	sta VDP_REG
+	jmp vdelay
+	.)
+
+	/* yr = low byte, ac = high byte with $40 for writing */
+vaddr	.(
+	sty VDP_REG
+	jsr vdelay
+	sta VDP_REG
+	jmp vdelay
+	.)
+
+inivdp	.(
+	ldx #7
+rl	lda regtab,x
+	jsr vreg
+	dex
+	bpl rl
+
+	/* patterns 0-31: blank */
+	ldy #<VDP_PATTAB
+	lda #>(VDP_PATTAB+$4000)
+	jsr vaddr
+	ldx #0
+	ldy #0
+bl	lda #0
+	sta VDP_VRAM
+	jsr vdelay
+	dex
+	bne bl
+	/* patterns 32-127 */
+	lda #<font
+	sta vp
+	lda #>font
+	sta vp+1
+	jsr fontcopy
+	/* 128-255 are the same, inverse */
+	ldy #<(VDP_PATTAB+$400)
+	lda #>(VDP_PATTAB+$4400)
+	jsr vaddr
+	ldx #0
+bl2	lda #$ff
+	sta VDP_VRAM
+	jsr vdelay
+	dex
+	bne bl2
+	lda #<font
+	sta vp
+	lda #>font
+	sta vp+1
+	ldy #$ff
+	jsr fontcopy2
+
+	/* empty screen */
+	ldy #<VDP_NAMETAB
+	lda #>(VDP_NAMETAB+$4000)
+	jsr vaddr
+	ldx #0
+	ldy #4
+cl	lda #" "
+	sta VDP_VRAM
+	jsr vdelay
+	dex
+	bne cl
+	dey
+	bne cl
+
+	lda #0
+	sta dhi
+	sta dhi+1
+	lda #$ff
+	sta dlo
+	sta dlo+1
+
+	lda #$d0		; 16k, display on, text mode
+	ldx #1
+	jmp vreg
+
+regtab	.byt $00		; no mode 3, no external video
+	.byt $90		; 16k, blank, text mode
+	.byt VDP_NAMETAB >> 10
+	.byt $00		; colour table, unused in text mode
+	.byt VDP_PATTAB >> 11
+	.byt $00, $00		; sprites, unused in text mode
+	.byt $f4		; white on dark blue
+
+	/* copy 96 characters from (vp), eor with yr */
+fontcopy
+	ldy #0
+fontcopy2
+	sty vtmp
+	ldx #0			; 96*8 = 768 bytes = 3 pages
+	lda #3
+	sta vcnt
+fc	ldy #0
+fc1	lda (vp),y
+	eor vtmp
+	sta VDP_VRAM
+	jsr vdelay
+	iny
+	bne fc1
+	inc vp+1
+	dec vcnt
+	bne fc
+	rts
+	.)
+
+/*
+ * Mark the line vzei points to as changed - if it is on the visible
+ * screen. Keeps all registers and flags, the generic code relies on them.
+ */
+vdirty_row .(
+	php
+	pha
+	lda actdev
+	cmp actscr
+	bne end
+	lda vzei+1		; offset into the screen: the buffers are
+	and #3			; 1k aligned
+	sta vtmp+1
+	lda vzei
+	cmp dlo
+	lda vtmp+1
+	sbc dlo+1
+	bcs nolo
+	lda vzei
+	sta dlo
+	lda vtmp+1
+	sta dlo+1
+nolo	lda vzei
+	clc
+	adc #39
+	sta vtmp
+	bcc nc
+	inc vtmp+1
+nc	lda dhi
+	cmp vtmp
+	lda dhi+1
+	sbc vtmp+1
+	bcs end
+	lda vtmp
+	sta dhi
+	lda vtmp+1
+	sta dhi+1
+end	pla
+	plp
+	rts
+	.)
+
+vdirty_all .(
+	php
+	pha
+	lda actdev
+	cmp actscr
+	bne end
+&vdirty_screen
+	lda #0
+	sta dlo
+	sta dlo+1
+	lda #<959
+	sta dhi
+	lda #>959
+	sta dhi+1
+end	pla
+	plp
+	rts
+	.)
+
+/*
+ * Copy the changed range of the visible screen into the VDP.
+ */
+vflush	.(
+	lda dhi
+	cmp dlo
+	lda dhi+1
+	sbc dlo+1
+	bcs dirty
+	rts
+dirty
+	/* count = dhi - dlo + 1 */
+	lda dhi
+	sec
+	sbc dlo
+	sta vcnt
+	lda dhi+1
+	sbc dlo+1
+	sta vcnt+1
+	inc vcnt
+	bne c1
+	inc vcnt+1
+c1
+	/* source address */
+	lda actscr
+	asl
+	asl
+	clc
+	adc #>SCRBUF
+	adc dlo+1
+	sta vp+1
+	lda dlo
+	sta vp
+	/* VRAM address */
+	ldy dlo
+	lda dlo+1
+	ora #>(VDP_NAMETAB+$4000)
+	jsr vaddr
+	/* the range is taken, start a new one */
+	lda #$ff
+	sta dlo
+	sta dlo+1
+	lda #0
+	sta dhi
+	sta dhi+1
+
+	ldy #0
+lo	lda (vp),y
+	sta VDP_VRAM
+	jsr vdelayl
+	iny
+	bne nc
+	inc vp+1
+nc	lda vcnt
+	bne dl
+	dec vcnt+1
+dl	dec vcnt
+	lda vcnt
+	ora vcnt+1
+	bne lo
+	rts
+	.)
+
+/*
+ * Switch the visible screen: all of it has to go to the VDP.
+ */
+&setact	.(
+	php
+	pha
+	jmp vdirty_screen
+	.)
+
+/**************************************************************************
+ * bell
+ */
+
+trigbell .(
+	lda bellq
+	cmp #8
+	bcs full
+	inc bellq
+full	rts
+	.)
+
+	/* once per tick - in the tick of the visible screen */
+bellirq	.(
+	lda curdev
+	cmp actscr
+	bne ret
+	lda bellt
+	beq next
+	dec bellt
+	bne ret
+	lda bellon		; tone over, a pause follows
+	beq next
+	lda #0
+	sta bellon
+	jsr snquiet
+	lda #BELL_PAUSE
+	sta bellt
+ret	rts
+next	lda bellq
+	beq ret
+	dec bellq
+	lda #0			; the high tone
+	jsr sntone
+	lda #1
+	sta bellon
+	lda #BELL_TONE
+	sta bellt
+	rts
+	.)
+
+/**************************************************************************
+ * cursor - an inverse character, blinking
+ */
+
+&&crsroff .(
+	bit crsrfl
+	bpl ret			; not enabled
+	bvc clr			; not inversed
+	ldy col
+	lda (vzei),y
+	and #$7f
+	sta (vzei),y
+	jsr vdirty_row
+clr	lda #0
+	sta crsrfl
+ret	rts
+	.)
+
+&&crsron .(
+	bit crsrfl
+	bmi irq			; already enabled
+	lda #0			; inverse cursor with the next call
+	sta crsrcnt
+	lda #128		; enabled, not inversed
+	sta crsrfl
+irq	dec crsrcnt
+	bpl ret
+	lda #CRSR_BLINK
+	sta crsrcnt
+	ldy col
+	lda (vzei),y
+	eor #$80
+	sta (vzei),y
+	jsr vdirty_row
+	lda crsrfl
+	eor #$40
+	sta crsrfl
+ret	rts
+	.)
+
+/**************************************************************************
+ * keyboard
+ *
+ * The controller puts a byte on port A of VIA3 and pulls CA1 low for two
+ * milliseconds. It does not wait for the handshake, so the byte is taken
+ * in the interrupt; getkey collects it with the timer tick.
+ */
+
+inikbd	.(
+	lda #0
+	sta kbw
+	sta kbr
+	sta VIA3+VIA_DDRA
+	lda #%11101010		; CA1 falling edge, CA2 pulse on read,
+	sta VIA3+VIA_PCR	; CB2 high, as the firmware sets it
+	lda VIA3+VIA_DRA	; clear a pending CA1
+	lda #%10000010		; CA1 interrupt on
+	sta VIA3+VIA_IER
+	rts
+	.)
+
+&dev_irq .(
+	lda VIA3+VIA_IFR
+	and #%00000010
+	beq noirq
+	lda VIA3+VIA_DRA	; clears CA1
+	cmp #KBD_DISCONNECTED	; the controller's status codes
+	bcs done
+	ldx kbw
+	sta kbuf,x
+	inx
+	txa
+	and #15
+	cmp kbr
+	beq done		; full - the key is lost
+	sta kbw
+done	lda #E_OK
+	rts
+noirq	lda #E_NOIRQ
+	rts
+	.)
+
+	/* returns c=0 and the character in ac and yr, xr=0 (no shift) */
+&getkey	.(
+	ldx kbr
+	cpx kbw
+	beq none
+	lda kbuf,x
+	pha
+	inx
+	txa
+	and #15
+	sta kbr
+	pla
+	ldx #4			; arrows and Backspace
+m	cmp kin,x
+	beq map
+	dex
+	bpl m
+	bmi nomap
+map	lda kout,x
+nomap	tay
+	ldx #0
+	clc
+	rts
+none	sec
+	rts
+
+	/* the controller sends the arrows as control codes - the down
+	   arrow would be LF, the left one BS; they become the console's
+	   cursor codes, which lsh ignores */
+kin	.byt 8, 21, 11, 10, 127
+kout	.byt 128, 129, 130, 131, 8
+	.)
+
+#include "devices/font_jp.a65"
+

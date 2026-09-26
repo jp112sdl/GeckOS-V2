@@ -1,0 +1,89 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * The SN76489 of the JP6502: data on port A of VIA2, READY on PB0,
+ * /WE on PB1, /CE on PB2 (low).
+ *
+ * snsend writes AC to the chip, keeps XR and YR. /WE low starts the
+ * write; the chip takes READY low while it latches the byte, 32 of its
+ * clocks, and the byte has to stay on port A until READY is high again.
+ * Both waits have a limit, for a board without the chip. Port B is
+ * changed read-modify-write, so the LED keeps its state.
+ *
+ * Used by the kernel start (to silence the chip), by the console bell
+ * and by the kernel's hardware error signal.
+ */
+
+#include "jp6502def.i65"
+
+&snsend	.(
+	phy
+	sta VIA2+VIA_DRA
+	lda VIA2+VIA_DRB
+	and #255-SN_WE
+	sta VIA2+VIA_DRB	; /WE low - the chip takes the byte
+	ldy #0
+w1	lda VIA2+VIA_DRB	; READY goes low...
+	and #SN_READY
+	beq w2
+	dey
+	bne w1
+w2	ldy #0
+w3	lda VIA2+VIA_DRB	; ... and high again when it has the byte
+	and #SN_READY
+	bne done
+	dey
+	bne w3
+done	lda VIA2+VIA_DRB
+	ora #SN_WE
+	sta VIA2+VIA_DRB
+	ply
+	rts
+	.)
+
+/*
+ * A beep on channel 0: sntone starts the tone in AC (0: high, 1: low),
+ * snquiet ends it.
+ */
+&sntone	.(
+	tay
+	lda tone1,y
+	jsr snsend
+	lda tone2,y
+	jsr snsend
+	lda #$90 | SN_BEEPVOL	; channel 0 volume
+	jmp snsend
+
+	; divider = clock / 32 / frequency, see jp6502def.i65
+#define	DIVHI	(SN_CLOCK / 32 / SN_HIGH_HZ)
+#define	DIVLO	(SN_CLOCK / 32 / SN_LOW_HZ)
+tone1	.byt $80 | (DIVHI & 15), $80 | (DIVLO & 15)
+tone2	.byt (DIVHI >> 4) & 63, (DIVLO >> 4) & 63
+	.)
+
+&snquiet .(
+	lda #$9f		; channel 0 off
+	jmp snsend
+	.)
+

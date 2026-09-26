@@ -39,6 +39,10 @@
  * If INIT_MERGE is defined, then files can be started with their STDOUT/STDERR
  * sent to the same device as the init process.
  *
+ * If INIT_BELL is defined (with INIT_VERBOSE), init sends a bell (^G) to
+ * its output when it has started everything - three when something could
+ * not be started.
+ *
  * If INIT_LIB6502 is defined, then PK_LIB ROM entries are supported and
  * started with the lib6502 forkto call - or at least with an undocumented
  * derivate... (argh, horrible code...).
@@ -91,6 +95,12 @@ s2	  .byt 0
 #ifdef INIT_MMU
 	.data
 actbank	.byt 0
+	.text
+#endif
+
+#ifdef INIT_BELL
+	.data
+failcnt	.byt 0		; entries that could not be started
 	.text
 #endif
 
@@ -238,6 +248,18 @@ nextbank
 #endif
 
 endloop   
+#ifdef INIT_BELL
+	  .(
+	  lda failcnt
+	  beq one
+	  lda #7
+	  jsr chrout
+	  lda #7
+	  jsr chrout
+one	  lda #7
+	  jsr chrout
+	  .)
+#endif
 
 #ifdef INIT_RESTART
 	  jmp restarts
@@ -246,6 +268,13 @@ endloop
 #endif
 
 slx1	jsr dostart
+#ifdef INIT_BELL
+	.(
+	bcc ok
+	inc failcnt
+	sec
+ok	.)
+#endif
 #ifdef INIT_RESTART
 	bcs norestart
 

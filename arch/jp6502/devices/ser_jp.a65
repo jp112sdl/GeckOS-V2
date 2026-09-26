@@ -1,0 +1,391 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * Serial device for the R6551 ACIA of the JP6502, which goes to the
+ * FT232R and from there over USB to the host. 19200 baud, 8N1.
+ *
+ * /CTS of the ACIA is the RTS line of the host: while the host does not
+ * set it, the 6551 does not transmit at all. /RTS goes to CTS of the
+ * host; it is held low (TIC=10 or 01), as the 6551 cannot raise it
+ * without switching its transmitter off too.
+ *
+ * devices/ser_acia.a65 is not used because it leaves the transmit
+ * interrupt on while there is nothing to send. On the 6551 that
+ * interrupt is a level: with the transmit register empty it never goes
+ * away, and the machine does nothing but enter the interrupt routine.
+ * Here the transmit interrupt is on only while the stream has data -
+ * the timer tick switches it on when data shows up, the interrupt
+ * routine switches it off when the stream runs dry.
+ *
+ * Received bytes are taken out of the ACIA first thing in every
+ * interrupt (FASTIRQ in kernel/kinit.a65) and put into a ring buffer:
+ * the ACIA holds a single byte, and the kernel keeps interrupts off
+ * longer than the half millisecond until the next one while it switches
+ * tasks. From the ring they go into the stream in the interrupt routine
+ * of this device, or with the next tick when the stream was full. Once
+ * the ring is full too, bytes are lost - there is no handshake to stop
+ * the sender.
+ *
+ * Like the console, the break key (Ctrl-C by default) signals SIG_BRK
+ * and Ctrl-Z SIG_SUSPEND to the foreground process. DEL, which is what
+ * terminal programs send for the backspace key, is turned into BS, which
+ * is what lsh and friends expect.
+ */
+
+#include "jp6502def.i65"
+
+#define	ACIA	ACIABASE
+
+/* command register */
+#define	CMD_OFF		%00000010	/* DTR high: receiver and interrupts off */
+#define	CMD_RX		%00001001	/* receiver and its interrupt on, RTS low,
+					   transmitter on without interrupt */
+#define	CMD_RXTX	%00000101	/* same with the transmit interrupt */
+
+/* control register: 1 stop bit, 8 bit, internal baud rate generator */
+#define	CTRL_BASE	%00010000
+#ifndef SER_BAUD
+#define	SER_BAUD	%1111		/* 19200 */
+#endif
+
+
+/* status bits besides DC_SW_RX and DC_SW_TX */
+#define	ST_TXIRQ	%00000001	/* transmit interrupt is on */
+
+	.(
+	.word devend
+	jmp prg
+	.asc "ser", sernr, 0
+-sernr += 1
+
+	.bss
+status	.byt 0
+instr	.byt 0		/* stream the device reads from and transmits */
+outstr	.byt 0		/* stream the device writes received data to */
+brkkey	.byt 0
+rxch	.byt 0
+dbusy	.byt 0
+&&ser_rxw .byt 0	/* the ring, written by FASTIRQ */
+&&ser_rxr .byt 0
+&&ser_rxbuf .dsb SER_RXBUFLEN
+	.text
+
+prg	cmp #DC_IRQ
+	beq irq
+	cmp #DC_TIMER
+	bne p1
+	jmp timer
+p1	cmp #DC_RES
+	bne p2
+	jmp reset
+p2	jmp others
+
+/*
+ * interrupt: pass on what FASTIRQ received, send a byte. The IRQ bit
+ * of the status is not used, FASTIRQ has read the status before.
+ */
+irq	.(
+	jsr drain
+	lda status
+	and #ST_TXIRQ
+	beq done
+	lda ACIA+ACIA_SR
+	and #%00010000		; transmit register empty?
+	beq done
+	jsr txbyte
+done	lda #E_OK
+	rts
+	.)
+
+	/* from the ring into the stream, until the stream is full. Every
+	   byte is a kernel call, so this runs with interrupts on, for
+	   FASTIRQ - and must not run twice at the same time. */
+drain	.(
+	lda dbusy
+	bne ret
+	inc dbusy
+	cli
+l	ldx ser_rxr
+	cpx ser_rxw
+	beq e
+	lda ser_rxbuf,x
+	jsr rxbyte
+	bcs e
+	lda ser_rxr
+	clc
+	adc #1
+	and #SER_RXBUFLEN-1
+	sta ser_rxr
+	jmp l
+e	sei
+	dec dbusy
+ret	rts
+	.)
+
+/*
+ * send the next byte from the stream, or switch the interrupt off
+ */
+txbyte	.(
+	ldx instr
+	jsr GETC
+	bcs nodata
+	sta ACIA+ACIA_DR
+	rts
+nodata	pha
+	jsr txirqoff
+	pla
+	cmp #E_EOF
+	bne ok
+	jmp txoff
+ok	rts
+	.)
+
+txirqoff .(
+	lda #CMD_RX
+	sta ACIA+ACIA_CMD
+	lda status
+	and #255-ST_TXIRQ
+	sta status
+	rts
+	.)
+
+/*
+ * a received byte in AC. c=1 when the stream is full - the byte stays
+ * in the ring then. The signal characters are not passed on.
+ */
+rxbyte	.(
+	sta rxch
+	lda status
+	and #DC_SW_RX
+	beq drop
+#ifndef SER_KEEP_DEL
+	lda rxch
+	cmp #127
+	bne nodel
+	lda #8
+	sta rxch
+nodel
+#endif
+	lda rxch
+	cmp brkkey
+	beq dobrk
+	cmp #26			; ^Z
+	bne put
+	lda #SIG_SUSPEND
+	bne sendsig
+dobrk	ldx outstr
+	lda #SC_SSTAT
+	ldy #SCE_BRK
+	jsr STRCMD
+	lda #SIG_BRK
+sendsig	tay
+	ldx outstr
+	lda #SC_FGSIG
+	jsr STRCMD
+drop	clc
+	rts
+put	ldx outstr
+	jsr PUTC
+	bcc ok
+	cmp #E_NUL
+	bne full
+	jsr rxoff		; nobody reads any more
+ok	clc
+	rts
+full	sec
+	rts
+	.)
+
+/*
+ * system tick: empty the ring, start transmitting when there is data
+ */
+timer	.(
+	jsr drain
+	lda status
+	and #DC_SW_TX
+	beq end
+	lda status
+	and #ST_TXIRQ
+	beq idle
+	; sending - the interrupt does that, but FASTIRQ reads the status
+	; in every interrupt, and a 6551 that clears its IRQ on that read
+	; would not ask again; so the tick sends too
+	lda ACIA+ACIA_SR
+	and #%00010000
+	beq end
+	jsr txbyte
+	jmp end
+idle	ldx instr
+	lda #SC_STAT
+	jsr STRCMD
+	cmp #E_EOF
+	bne noeof
+	jmp txoff
+noeof	cmp #E_SEMPTY
+	beq end
+	php
+	sei
+	lda status
+	ora #ST_TXIRQ
+	sta status
+	lda #CMD_RXTX		; the interrupt comes at once, the
+	sta ACIA+ACIA_CMD	; transmit register is empty
+	plp
+end	lda #E_NOIRQ
+	rts
+	.)
+
+/*
+ * DC_RES
+ */
+reset	.(
+	lda #0
+	sta status
+	sta instr
+	sta outstr
+	sta ser_rxw
+	sta ser_rxr
+	lda #3			; ^C
+	sta brkkey
+	; Command, then control, like the firmware. No programmed reset
+	; (a write to the status register) before: the R6551 of the board
+	; did not take the register writes right after one, and was left
+	; with RTS high and the receiver off. The /RES pin is on the
+	; system reset anyway.
+	lda #CMD_RX
+	sta ACIA+ACIA_CMD
+	lda #CTRL_BASE | SER_BAUD
+	sta ACIA+ACIA_CTRL
+	lda ACIA+ACIA_DR	; drop whatever is in there
+	lda ACIA+ACIA_SR
+	clc
+	rts
+	.)
+
+/*
+ * everything else
+ */
+others	.(
+	cmp #DC_GS
+	bne o1
+	lda status
+	and #DC_SW_TX
+	bne don
+	sty instr
+	jmp ok
+don	jmp devon
+o1	cmp #DC_PS
+	bne o2
+	lda status
+	and #DC_SW_RX
+	bne don
+	sty outstr
+	jmp ok
+o2	cmp #DC_RX_ON
+	bne o3
+	lda #0
+	sta ser_rxr
+	sta ser_rxw
+	lda #DC_SW_RX
+	bne o2a
+o3	cmp #DC_TX_ON
+	bne o4
+	lda #DC_SW_TX
+o2a	ora status
+	sta status
+	jmp ok
+o4	cmp #DC_RX_OFF
+	bne o5
+	jmp rxoff
+o5	cmp #DC_TX_OFF
+	bne o6
+	jmp txoff
+o6	cmp #DC_SPD
+	bne o7
+	tya
+	and #%00001111
+	ora #CTRL_BASE
+	sta ACIA+ACIA_CTRL
+	jmp ok
+o7	cmp #DC_HS		; no handshake lines
+	beq ok
+	cmp #DC_ST
+	beq ok
+	cmp #DC_BRKKEY
+	bne o8
+	lda brkkey
+	sty brkkey
+	tay
+	jmp ok
+o8	cmp #DC_EXIT
+	bne notimp
+	jsr rxoff
+	jsr txoff
+	lda #CMD_OFF
+	sta ACIA+ACIA_CMD
+	jmp ok
+	.)
+
+rxoff	.(
+	lda status
+	and #DC_SW_RX
+	beq devoff
+	ldx outstr
+	lda #SC_EOF
+	jsr STRCMD
+	lda status
+	and #255-DC_SW_RX
+	sta status
+	jmp ok
+	.)
+
+txoff	.(
+	lda status
+	and #DC_SW_TX
+	beq devoff
+	php
+	sei
+	jsr txirqoff
+	plp
+	ldx instr
+	lda #SC_NUL
+	jsr STRCMD
+	lda status
+	and #255-DC_SW_TX
+	sta status
+	jmp ok
+	.)
+
+ok	lda #E_OK
+	.byt $2c
+devon	lda #E_DON
+	.byt $2c
+devoff	lda #E_DOFF
+	.byt $2c
+notimp	lda #E_NOTIMP
+	cmp #1
+	rts
+
+devend	.)
+

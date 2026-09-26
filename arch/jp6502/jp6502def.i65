@@ -1,0 +1,119 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * Hardware of the JP6502 board (a DB6502 derivative).
+ *
+ *	$0000-$7fff	32k RAM
+ *	$8080		TMS9918 video display processor
+ *	$8200		VIA3	PS/2 keyboard controller (port A, CA1/CA2),
+ *				SD card, bit-banged SPI (port B)
+ *	$8400		R6551 ACIA, USB serial through an FT232R
+ *	$8800		VIA2	SN76489 sound (port A, PB0-PB2), LED (PB7),
+ *				D-pad (PB3-PB6)
+ *	$9000		VIA1	HD44780 LCD, 20x4, 8 bit (port B data,
+ *				PA7=E, PA6=RW, PA5=RS)
+ *	$a000-$ffff	24k ROM
+ *
+ * All three VIAs and the ACIA share the IRQ line.
+ */
+
+#ifndef _JP6502DEF_
+#define _JP6502DEF_
+
+#include "chips/via6522.i65"
+#include "chips/acia6551.i65"
+
+#define	VDP_VRAM	$8080
+#define	VDP_REG		$8081
+
+#define	VIA3		$8200
+#define	ACIABASE	$8400
+#define	VIA2		$8800
+#define	VIA1		$9000
+
+/* VIA2 port B */
+#define	SN_READY	%00000001
+#define	SN_WE		%00000010
+#define	SN_CE		%00000100
+#define	LED_BIT		%10000000
+
+/*
+ * The beeps of the SN76489. The chip runs on the same oscillator as the
+ * CPU, so its clock follows CLOCK_MHZ; a tone is clock / (32 * divider),
+ * the divider has 10 bits.
+ */
+#ifndef SN_CLOCK
+#define	SN_CLOCK	(CLOCK_MHZ * 1000000)
+#endif
+#define	SN_HIGH_HZ	880	/* start, end of boot, console bell */
+#define	SN_LOW_HZ	440	/* hardware error */
+#define	SN_BEEPVOL	8	/* 0 loudest .. 15 off */
+
+#define	BEEP_START_MS	120	/* at reset */
+#define	BEEP_BELL_MS	100	/* end of boot (one), boot error (three),
+				   and every ^G on the console */
+#define	BEEP_GAP_MS	80	/* between two bells */
+#define	BEEP_ERR_MS	120	/* three low ones: the kernel cannot start */
+#define	BEEP_ERR_GAP_MS	100	/* the times at reset and for errors are
+				   rounded down to 20 ms, the others to
+				   the system tick */
+
+/* VIA3 port B - SD card */
+#define	SD_CS		%00000010
+#define	SD_SCK		%00000100
+#define	SD_MOSI		%00001000
+#define	SD_MISO		%00010000
+
+/* receive ring of the serial device, filled by FASTIRQ, power of two */
+#define	SER_RXBUFLEN	64
+
+/* codes the keyboard controller sends besides characters */
+#define	KBD_CONNECTED		$ff
+#define	KBD_DISCONNECTED	$fe
+
+/*
+ * CPU clock in MHz, 1, 2, 4 or 8. It sets the system timer, which counts
+ * PHI2, and the pacing of the VDP accesses. The Makefile passes it in.
+ */
+#ifndef CLOCK_MHZ
+#define	CLOCK_MHZ	4
+#endif
+
+/*
+ * The system tick, timer 1 of VIA2. The timer is 16 bit, so at 8 MHz it
+ * cannot count down 10 ms; the rate goes up there instead.
+ */
+#if CLOCK_MHZ > 4
+#define	TICK_HZ		125
+#else
+#if CLOCK_MHZ > 1
+#define	TICK_HZ		100
+#else
+#define	TICK_HZ		50
+#endif
+#endif
+
+#define	TICK_LATCH	(CLOCK_MHZ * 1000000 / TICK_HZ - 2)
+
+#endif

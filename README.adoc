@@ -37,6 +37,9 @@ Here you can find the current set of disk images for the currently active ports:
 * link:arch/c64/boot/geckos64.d64[C64 geckos64.d64]
 * link:arch/c128/boot/geckos128.d64[C128 geckos128.d64]
 
+The JP6502 port builds a ROM image, arch/jp6502/boot/geckos.bin, and loads its
+programs from an SD card - see link:doc/jp6502.p.adoc[jp6502(p)].
+
 Have fun!
 
 21 may 2024 André Fachat

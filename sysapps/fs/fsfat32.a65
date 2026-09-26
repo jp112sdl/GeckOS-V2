@@ -1,0 +1,3009 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * fsfat32 - filesystem server for FAT32 media, one drive.
+ *
+ * Written for the SD card of the JP6502, but the medium is reached only
+ * through a block driver, included with FSFAT32_DEVICE. It provides
+ *
+ *	blk_init	c=0 when the medium is there
+ *	blk_read	read block blk_lba (4 bytes, low first) to (blk_ptr)
+ *	blk_write	write (blk_ptr) to block blk_lba
+ *
+ * with 512 byte blocks.
+ *
+ * The medium is either a "superfloppy" or has an MBR, of which the first
+ * FAT32 partition is used. Names are 8.3, and are shown in lower case;
+ * long file names are ignored when reading, and not written. Entries of
+ * long names that belong to a file that is deleted or renamed are removed
+ * as long as they are in the same sector as the short entry.
+ *
+ * Supported: FS_OPEN_RD, FS_OPEN_WR and FS_OPEN_OW (both truncate an
+ * existing file), FS_OPEN_AP, FS_OPEN_DR (with * and ? in the last part
+ * of the path), FS_DELETE, FS_RENAME (in the same directory), FS_MKDIR,
+ * FS_RMDIR.
+ *
+ * The card can be changed while no file is open: before every request
+ * that finds nothing open, the boot sector is read again and its serial
+ * number compared.
+ *
+ * There is no clock, so new and written files get FSFAT32_DATE and
+ * FSFAT32_TIME (FAT encoding).
+ */
+
+#ifndef FSFAT32_MAXFILE
+#define	FSFAT32_MAXFILE	4
+#endif
+#define	MAXF		FSFAT32_MAXFILE
+
+#ifndef FSFAT32_DATE
+#define	FSFAT32_DATE	((2026-1980)<<9) | (1<<5) | 1	/* 2026-01-01 */
+#endif
+#ifndef FSFAT32_TIME
+#define	FSFAT32_TIME	(12<<11)			/* 12:00:00 */
+#endif
+
+/* open file table, one entry per file */
+#define	FT_STATE	0	/* ST_* */
+#define	FT_STR		1	/* the stream */
+#define	FT_CLUS		2	/* 4: current cluster */
+#define	FT_SEC		6	/* sector in that cluster, $ff: none yet */
+#define	FT_POS		7	/* 2: next byte in the buffer */
+#define	FT_LEN		9	/* 2: bytes in the buffer (read) */
+#define	FT_LEFT		11	/* 4: bytes left (read), file size (write) */
+#define	FT_FIRST	15	/* 4: first cluster (write) */
+#define	FT_ELBA		19	/* 4: sector with the directory entry (write) */
+#define	FT_EOFF		23	/* 2: its offset in there */
+#define	FT_PHASE	25	/* directory: 0 name, 1 entries, 2 free, 3 end */
+#define	FT_OIDX		26	/* directory: next byte of FT_OBUF to send */
+#define	FT_OLEN		27	/* directory: bytes in FT_OBUF */
+#define	FT_OBUF		28	/* directory: 24 bytes, the entry being sent */
+#define	FT_PAT		52	/* directory: 11 bytes, the pattern */
+#define	FT_SLEN		64
+
+#define	ST_FREE		0
+#define	ST_RD		1
+#define	ST_DIR		2
+#define	ST_WR		3
+
+/*
+ * 32 bit helpers, little endian, on the variables in the block at R.
+ * They use XR and YR.
+ */
+#define	CP32(d,s)	ldx #d-R :ldy #s-R :jsr cp32
+#define	ADD32(d,b)	ldx #d-R :ldy #b-R :jsr add32	/* d += b */
+#define	ZERO32(d)	ldx #d-R :jsr zero32
+#define	INC32(d)	ldx #d-R :jsr inc32
+#define	DEC32(d)	ldx #d-R :jsr dec32
+#define	EQ32(a,b)	ldx #a-R :ldy #b-R :jsr eq32	/* z=1 if a == b */
+#define	CMP32(a,b)	ldx #a-R :ldy #b-R :jsr cmp32	/* c=1 if a >= b */
+
+	.(
+#ifdef ROM
+	.word ende
+	.byt PK_FS+$80		; file type = filesystem + auto-exec bit
+	.word PRG
+	.byt 16			; RAM size in 256-byte blocks
+	.byt $80		; shared mem size
+	.byt 0			; priority
+	.word 0			; stdin, stdout/stderr device number
+	.asc "fsfat32",0,0
+#endif
+
+	.zero
+fz	.word 0			; open file table entry
+bp	.word 0			; its buffer
+ep	.word 0			; directory entry in the cache
+np	.word 0			; name being parsed
+tp	.word 0
+
+	.bss
+owntask	.byt 0
+client	.byt 0
+cmdcode	.byt 0
+nopen	.byt 0
+actf	.byt 0
+mounted	.byt 0
+
+vlabel	.dsb 11
+nfats	.byt 0
+spc	.byt 0			; sectors per cluster
+spcsh	.byt 0			; its log2
+
+
+cache	.dsb 512		; FAT and directory sectors
+cvalid	.byt 0
+cdirty	.byt 0
+cfat	.byt 0			; cache holds a FAT sector
+
+dsec	.byt 0			; sector in it,
+doff	.word 0			; entry offset in the sector
+
+name83	.dsb 11
+e_attr	.byt 0			; lookup: what was found
+e_off	.word 0
+f_have	.byt 0			; lookup: free slot in pclus
+f_off	.word 0
+
+o_off	.word 0
+cnt	.byt 0
+fcnt	.byt 0
+mkattr	.byt 0
+star	.byt 0
+
+ftab	.dsb MAXF*FT_SLEN
+fbuf	.dsb MAXF*512
+
+	; all the 32 bit variables, for the helpers
+R
+part	.dsb 4
+fatlba	.dsb 4
+datalba	.dsb 4
+fatsz	.dsb 4
+root	.dsb 4
+maxclus	.dsb 4
+fsinfo	.dsb 4
+freecl	.dsb 4
+nxtfree	.dsb 4
+serial	.dsb 4
+acc	.dsb 4
+tmp	.dsb 4
+slba	.dsb 4
+clba	.dsb 4
+dclus	.dsb 4
+dlast	.dsb 4
+cur	.dsb 4
+pclus	.dsb 4
+e_clus	.dsb 4
+e_size	.dsb 4
+e_lba	.dsb 4
+f_lba	.dsb 4
+aprev	.dsb 4
+astart	.dsb 4
+acur	.dsb 4
+fval	.dsb 4
+ftmp	.dsb 4
+ftmp2	.dsb 4
+o_lba	.dsb 4
+wlba	.dsb 4
+r32c	.byt 0
+	.text
+
+#include FSFAT32_DEVICE
+
+/**************************************************************************
+ * 32 bit helpers, see the macros above
+ */
+
+cp32	.(
+	lda #4
+	sta r32c
+l	lda R,y
+	sta R,x
+	inx
+	iny
+	dec r32c
+	bne l
+	rts
+	.)
+
+add32	.(
+	lda #4
+	sta r32c
+	clc
+l	lda R,x
+	adc R,y
+	sta R,x
+	inx
+	iny
+	dec r32c
+	bne l
+	rts
+	.)
+
+sub32	.(
+	lda #4
+	sta r32c
+	sec
+l	lda R,x
+	sbc R,y
+	sta R,x
+	inx
+	iny
+	dec r32c
+	bne l
+	rts
+	.)
+
+cmp32	.(
+	lda #4
+	sta r32c
+	sec
+l	lda R,x
+	sbc R,y
+	inx
+	iny
+	dec r32c
+	bne l
+	rts
+	.)
+
+	/* ends with z=1 from the dec when all four are equal */
+eq32	.(
+	lda #4
+	sta r32c
+l	lda R,x
+	cmp R,y
+	bne e
+	inx
+	iny
+	dec r32c
+	bne l
+e	rts
+	.)
+
+zero32	.(
+	lda #0
+	sta R,x
+	sta R+1,x
+	sta R+2,x
+	sta R+3,x
+	rts
+	.)
+
+inc32	.(
+	inc R,x
+	bne e
+	inc R+1,x
+	bne e
+	inc R+2,x
+	bne e
+	inc R+3,x
+e	rts
+	.)
+
+dec32	.(
+	lda R,x
+	bne d1
+	lda R+1,x
+	bne d2
+	lda R+2,x
+	bne d3
+	dec R+3,x
+d3	dec R+2,x
+d2	dec R+1,x
+d1	dec R,x
+	rts
+	.)
+
+	/* the block driver's sector number from slba */
+blkset	.(
+	ldx #3
+l	lda slba,x
+	sta blk_lba,x
+	dex
+	bpl l
+	rts
+	.)
+
+/**************************************************************************
+ * task entry and main loop
+ */
+
+PRG	.(
+	stx owntask
+	lda #0
+	sta mounted
+	sta cvalid
+	sta cdirty
+	sta nopen
+	ldx #MAXF-1
+cl	jsr setfz
+	lda #ST_FREE
+	ldy #FT_STATE
+	sta (fz),y
+	dex
+	bpl cl
+
+	; we inherit the PCBUF from the FORK
+	lda #1			; one drive
+	sta PCBUF+FM_REG_DRVS
+	lda owntask
+	sta PCBUF+FM_REG_ENV
+	lda #FM_REG
+	ldx #SEND_FM
+	ldy #2
+	jsr SEND
+	php
+	ldx #SEM_SENDBUF
+	jsr VSEM
+	plp
+	bcc loop
+	jmp TERM
+
+loop	lda nopen
+	bne poll
+	sec			; nothing open - wait for a request
+	.byt $24
+poll	clc
+	jsr RECEIVE
+	bcs nomsg
+	jsr rxmess
+nomsg	jsr serve
+	lda nopen
+	beq loop
+	jsr YIELD
+	jmp loop
+	.)
+
+	/* xr = file number -> fz, bp; keeps xr */
+setfz	.(
+	stx actf
+	txa
+	asl
+	asl
+	asl
+	asl
+	asl
+	asl
+	clc
+	adc #<ftab
+	sta fz
+	lda #>ftab
+	adc #0
+	sta fz+1
+	txa
+	asl
+	clc
+	adc #>fbuf
+	sta bp+1
+	lda #<fbuf
+	sta bp
+	rts
+	.)
+
+	/* free file in xr, c=1 if none */
+getfre	.(
+	ldx #0
+l	jsr setfz
+	ldy #FT_STATE
+	lda (fz),y
+	beq ok
+	inx
+	cpx #MAXF
+	bcc l
+	sec
+	rts
+ok	clc
+	rts
+	.)
+
+ffree	.(
+	lda #ST_FREE
+	ldy #FT_STATE
+	sta (fz),y
+	rts
+	.)
+
+serve	.(
+	lda #0
+	sta nopen
+	ldx #0
+l	jsr setfz
+	ldy #FT_STATE
+	lda (fz),y
+	beq next
+	inc nopen
+	cmp #ST_RD
+	bne n1
+	jsr do_rd
+	jmp next
+n1	cmp #ST_DIR
+	bne n2
+	jsr do_dir
+	jmp next
+n2	jsr do_wr
+next	ldx actf
+	inx
+	cpx #MAXF
+	bcc l
+	rts
+	.)
+
+/**************************************************************************
+ * requests
+ */
+
+rxmess	.(
+	stx client
+	sta cmdcode
+	lda #<PCBUF+FS_OPEN_NAME	; == FS_CMD_NAME
+	sta np
+	lda #>PCBUF+FS_OPEN_NAME
+	sta np+1
+	jsr chkmount
+	bcs err
+	lda cmdcode
+	ldx #0
+l	cmp cmdtab,x
+	beq found
+	inx
+	cpx #cmdend-cmdtab
+	bcc l
+	lda #E_NOTIMP
+err	ldy #0
+	jmp reply
+found	txa
+	asl
+	tax
+	lda cmdadr+1,x
+	pha
+	lda cmdadr,x
+	pha
+	rts
+
+cmdtab	.byt FS_OPEN_RD, FS_OPEN_WR, FS_OPEN_OW, FS_OPEN_AP, FS_OPEN_DR
+	.byt FS_DELETE, FS_RENAME, FS_MKDIR, FS_RMDIR, FS_CLOSE
+cmdend
+cmdadr	.word op_rd-1, op_wr-1, op_wr-1, op_ap-1, op_dir-1
+	.word op_del-1, op_ren-1, op_mkdir-1, op_rmdir-1, op_close-1
+	.)
+
+	/* ac = error, yr = file number */
+reply	.(
+	sta PCBUF+FS_X_ERR
+	ldx owntask
+	stx PCBUF+FS_X_ENV
+	sty PCBUF+FS_X_FIL
+	ldy #FS_X_SLEN
+	ldx client
+	jmp SEND
+	.)
+
+replyok	lda #E_OK
+	ldy actf
+	jmp reply
+
+replyerr .(
+	pha
+	jsr cache_flush
+	pla
+	ldy #0
+	jmp reply
+	.)
+
+op_close .(
+	lda #E_OK
+	ldy #0
+	jmp reply
+	.)
+
+/*
+ * open for reading
+ */
+op_rd	.(
+	jsr lookup
+	bcs err
+	lda e_attr
+	and #$10
+	bne nofile
+	jsr getfre
+	bcs nomem
+	lda PCBUF+FS_OPEN_STR
+	ldy #FT_STR
+	sta (fz),y
+	ldy #FT_CLUS
+	ldx #0
+l	lda e_clus,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc l
+	ldy #FT_LEFT
+	ldx #0
+l2	lda e_size,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc l2
+	lda #$ff
+	ldy #FT_SEC
+	sta (fz),y
+	lda #0
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+	iny
+	sta (fz),y		; FT_LEN
+	iny
+	sta (fz),y
+	lda #ST_RD
+	ldy #FT_STATE
+	sta (fz),y
+	jmp replyok
+nofile	lda #E_FNOFIL
+	.byt $2c
+nomem	lda #E_NOMEM
+err	jmp replyerr
+	.)
+
+/*
+ * open a directory. The last part of the name may contain wildcards;
+ * a name without them that is a directory is listed completely.
+ */
+op_dir	.(
+	jsr getfre
+	bcc brx18
+	jmp nomem
+brx18
+	; find the last part
+	ldy #0
+	sty tmp			; position after the last "/"
+l0	lda (np),y
+	beq e0
+	iny
+	cmp #DIRSIGN
+	bne l0
+	sty tmp
+	beq l0
+e0	; wildcards in it?
+	ldy tmp
+l1	lda (np),y
+	beq plain
+	cmp #"*"
+	beq wild
+	cmp #"?"
+	beq wild
+	iny
+	bne l1
+plain	ldy tmp
+	lda (np),y
+	beq all			; empty: the directory itself
+	lda np
+	pha
+	lda np+1
+	pha
+	jsr lookup
+	pla
+	sta np+1
+	pla
+	sta np
+	bcc brx17
+	jmp err
+brx17
+	lda e_attr
+	and #$10
+	beq single
+	CP32(cur, e_clus)
+	jmp allpat
+single	CP32(cur, pclus)	; a file: its directory, and its name
+	ldx #10
+s1	txa
+	clc
+	adc #FT_PAT
+	tay
+	lda name83,x
+	sta (fz),y
+	dex
+	bpl s1
+	jmp opened
+
+wild	; split at the last "/"
+	ldy tmp
+	jsr dirpart
+	bcs err
+	ldy tmp			; pattern from the last part
+	jsr make83y
+	bcs badname
+	ldx #10
+w1	txa
+	clc
+	adc #FT_PAT
+	tay
+	lda name83,x
+	sta (fz),y
+	dex
+	bpl w1
+	jmp opened
+
+all	ldy tmp
+	jsr dirpart
+	bcs err
+allpat	ldy #FT_PAT
+	lda #"?"
+a1	sta (fz),y
+	iny
+	cpy #FT_PAT+11
+	bcc a1
+
+opened	CP32(acc, cur)
+	jsr dinit
+	ldy #FT_CLUS
+	ldx #0
+o1	lda dclus,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc o1
+	lda #0
+	ldy #FT_SEC
+	sta (fz),y
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+	ldy #FT_PHASE
+	sta (fz),y
+	ldy #FT_OIDX
+	sta (fz),y
+	ldy #FT_OLEN
+	sta (fz),y
+	lda PCBUF+FS_OPEN_STR
+	ldy #FT_STR
+	sta (fz),y
+	lda #ST_DIR
+	ldy #FT_STATE
+	sta (fz),y
+	jmp replyok
+
+badname	lda #E_FNAMLEN
+	.byt $2c
+nomem	lda #E_NOMEM
+err	jmp replyerr
+
+	/* look up the name up to position yr (without it) as directory */
+dirpart	.(
+	lda (np),y
+	pha
+	sty tmp+1
+	lda #0
+	sta (np),y
+	lda np
+	pha
+	lda np+1
+	pha
+	jsr lookup
+	pla
+	sta np+1
+	pla
+	sta np
+	ldy tmp+1
+	pla
+	sta (np),y
+	bcs derr
+	lda e_attr
+	and #$10
+	beq nopath
+	CP32(cur, e_clus)
+	clc
+	rts
+nopath	lda #E_FNOPATH
+	sec
+derr	rts
+	.)
+	.)
+
+/*
+ * open for writing, truncates an existing file
+ */
+op_wr	.(
+	jsr getfre
+	bcc brx16
+	jmp nomem
+brx16
+	jsr lookup
+	bcc exists
+	cmp #E_FNOFIL
+	bne err
+	lda #$20		; archive
+	jsr mkentry
+	bcs err
+	jmp setup
+exists	jsr wrcheck
+	bcs err
+	CP32(acc, e_clus)
+	jsr freechain
+	bcs err
+	jsr entry_get		; entry: no clusters, no size
+	ldy #$14
+	lda #0
+	sta (ep),y
+	iny
+	sta (ep),y
+	ldy #$1a
+t1	sta (ep),y
+	iny
+	cpy #$20
+	bcc t1
+	inc cdirty
+	jsr cache_flush
+	bcs err
+setup	lda #$ff
+	ldy #FT_SEC
+	sta (fz),y
+	lda #0
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+	ldy #FT_LEFT
+z1	sta (fz),y		; size and first cluster
+	iny
+	cpy #FT_FIRST+4
+	bcc z1
+&wrsetup
+	ldx #0
+	ldy #FT_ELBA
+e1	lda e_lba,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc e1
+	lda e_off
+	sta (fz),y
+	iny
+	lda e_off+1
+	sta (fz),y
+	lda PCBUF+FS_OPEN_STR
+	ldy #FT_STR
+	sta (fz),y
+	lda #ST_WR
+	ldy #FT_STATE
+	sta (fz),y
+	jmp replyok
+nomem	lda #E_NOMEM
+err	jmp replyerr
+	.)
+
+	/* the found entry can be written to? */
+wrcheck	.(
+	lda e_attr
+	and #$10
+	bne isdir
+	lda e_attr
+	and #$01
+	bne ro
+	clc
+	rts
+isdir	lda #E_FILEXIST
+	.byt $2c
+ro	lda #E_FWPROT
+	sec
+	rts
+	.)
+
+/*
+ * open for appending
+ */
+op_ap	.(
+	jsr getfre
+	bcc brx15
+	jmp nomem
+brx15
+	jsr lookup
+	bcc exists
+	cmp #E_FNOFIL
+	beq brx14
+	jmp err
+brx14
+	jmp op_wr		; does not exist: create
+exists	jsr wrcheck
+	bcc brx13
+	jmp err
+brx13
+	ldy #FT_LEFT		; size
+	ldx #0
+s	lda e_size,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc s
+	ldy #FT_FIRST
+	ldx #0
+f	lda e_clus,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc f
+	lda #0
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+	lda e_size		; empty: like a new file
+	ora e_size+1
+	ora e_size+2
+	ora e_size+3
+	beq empty
+	lda e_clus
+	ora e_clus+1
+	ora e_clus+2
+	ora e_clus+3
+	bne walk
+empty	lda #$ff
+	ldy #FT_SEC
+	sta (fz),y
+	jmp wrsetup
+
+walk	; tmp = size - 1: the last byte
+	lda e_size
+	sec
+	sbc #1
+	sta tmp
+	lda e_size+1
+	sbc #0
+	sta tmp+1
+	lda e_size+2
+	sbc #0
+	sta tmp+2
+	lda e_size+3
+	sbc #0
+	sta tmp+3
+	; its sector in the file: tmp >> 9
+	ldx #9
+sh	lsr tmp+3
+	ror tmp+2
+	ror tmp+1
+	ror tmp
+	dex
+	bne sh
+	lda spc			; sector in its cluster
+	sec
+	sbc #1
+	and tmp
+	ldy #FT_SEC
+	sta (fz),y
+	ldx spcsh		; clusters to skip
+	beq sk
+sh2	lsr tmp+3
+	ror tmp+2
+	ror tmp+1
+	ror tmp
+	dex
+	bne sh2
+sk	CP32(acc, e_clus)
+wl	lda tmp
+	ora tmp+1
+	ora tmp+2
+	ora tmp+3
+	beq last
+	jsr fat_get
+	bcs err
+	jsr iseoc
+	bcs bad
+	DEC32(tmp)
+	jmp wl
+last	ldy #FT_CLUS
+	ldx #0
+c	lda acc,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc c
+	lda e_size		; bytes in the last sector
+	ldy #FT_POS
+	sta (fz),y
+	lda e_size+1
+	and #1
+	iny
+	sta (fz),y
+	dey
+	ora (fz),y
+	bne partial
+	ldy #FT_SEC		; the sector is full, the next one follows
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	jmp wrsetup
+partial	jsr fzlba		; read what is there
+	lda bp
+	sta blk_ptr
+	lda bp+1
+	sta blk_ptr+1
+	jsr blk_read
+	bcs ioerr
+	jmp wrsetup
+bad	lda #E_FNOFIL
+	.byt $2c
+ioerr	lda #E_FNODRV
+	.byt $2c
+nomem	lda #E_NOMEM
+err	jmp replyerr
+	.)
+
+/*
+ * delete a file
+ */
+op_del	.(
+	jsr lookup
+	bcs err
+	jsr wrcheck
+	bcs err
+	jsr remove
+	bcs err
+	lda #E_OK
+	ldy #0
+	jmp reply
+err	jmp replyerr
+	.)
+
+	/* free the clusters of the found entry and delete it */
+remove	.(
+	CP32(acc, e_clus)
+	jsr freechain
+	bcs err
+	jsr entry_get
+	jsr delent
+	jsr cache_flush
+	bcs err
+	jmp fsinfo_put
+err	rts
+	.)
+
+/*
+ * rename: first name the old one (path included), second the new one,
+ * of which only the last part counts - it stays in the same directory
+ */
+op_ren	.(
+	jsr lookup
+	bcs err
+	CP32(o_lba, e_lba)
+	lda e_off
+	sta o_off
+	lda e_off+1
+	sta o_off+1
+	ldy #0			; skip to the second name
+l	lda (np),y
+	beq nx
+	iny
+	bne l
+nx	iny			; and there to its last part
+	sty tmp
+l2	lda (np),y
+	beq e2
+	iny
+	cmp #DIRSIGN
+	bne l2
+	sty tmp
+	beq l2
+e2	ldy tmp
+	jsr make83y
+	bcs badname
+	CP32(cur, pclus)
+	jsr dsearch
+	bcc exists
+	CP32(e_lba, o_lba)
+	lda o_off
+	sta e_off
+	lda o_off+1
+	sta e_off+1
+	jsr entry_get
+	ldy #10
+n	lda name83,y
+	sta (ep),y
+	dey
+	bpl n
+	jsr dellfn
+	inc cdirty
+	jsr cache_flush
+	bcs err
+	lda #E_OK
+	ldy #0
+	jmp reply
+exists	lda #E_FILEXIST
+	.byt $2c
+badname	lda #E_FNAMLEN
+err	jmp replyerr
+	.)
+
+/*
+ * make a directory
+ */
+op_mkdir .(
+	jsr lookup
+	bcs brx12
+	jmp exists
+brx12
+	cmp #E_FNOFIL
+	beq brx11
+	jmp err
+brx11
+	ZERO32(acc)		; its cluster
+	jsr alloc
+	bcc brx10
+	jmp err
+brx10
+	CP32(ftmp2, acc)
+	jsr zerocl
+	bcc brx9
+	jmp err
+brx9
+	; "." and ".." in the first sector - the cache is zero now
+	CP32(acc, ftmp2)
+	jsr clus2lba
+	CP32(clba, slba)
+	lda #1
+	sta cvalid
+	lda #0
+	sta cfat
+	ldx #10
+	lda #" "
+d1	sta cache,x
+	sta cache+32,x
+	dex
+	bpl d1
+	lda #"."
+	sta cache
+	sta cache+32
+	sta cache+33
+	lda #<cache
+	sta ep
+	lda #>cache
+	sta ep+1
+	CP32(acc, ftmp2)
+	jsr dotent
+	lda #<cache+32
+	sta ep
+	lda #>cache+32
+	sta ep+1
+	CP32(acc, pclus)	; the root is 0 in ".."
+	EQ32(acc, root)
+	bne notroot
+	ZERO32(acc)
+notroot	jsr dotent
+	inc cdirty
+	jsr cache_flush
+	bcs err
+	lda #$10		; the entry in the parent
+	jsr mkentry
+	bcs err
+	jsr entry_get
+	CP32(acc, ftmp2)
+	jsr setclus
+	inc cdirty
+	jsr cache_flush
+	bcs err
+	jsr fsinfo_put
+	lda #E_OK
+	ldy #0
+	jmp reply
+exists	lda #E_FILEXIST
+err	jmp replyerr
+
+	/* fill in the "." or ".." entry at ep, cluster acc */
+dotent	ldy #$0b
+	lda #$10
+	sta (ep),y
+	jsr stamp
+	jmp setclus
+	.)
+
+/*
+ * remove an empty directory
+ */
+op_rmdir .(
+	jsr lookup
+	bcs err
+	lda e_attr
+	and #$10
+	beq nodir
+	EQ32(e_clus, root)	; not the root
+	beq nodir
+	CP32(o_lba, e_lba)	; dsearch below overwrites nothing of
+	lda e_off		; the e_*, but the walk moves the cache
+	sta o_off
+	lda e_off+1
+	sta o_off+1
+	CP32(acc, e_clus)
+	jsr dinit
+l	jsr dcur
+	bcs err
+	ldy #0
+	lda (ep),y
+	beq empty
+	cmp #$e5
+	beq next
+	cmp #"."
+	beq next
+	ldy #$0b
+	lda (ep),y
+	cmp #$0f
+	beq next
+	lda #E_FDNEMPTY
+	jmp err
+next	jsr dnext
+	bcc l
+empty	CP32(e_lba, o_lba)
+	lda o_off
+	sta e_off
+	lda o_off+1
+	sta e_off+1
+	jsr remove
+	bcs err
+	lda #E_OK
+	ldy #0
+	jmp reply
+nodir	lda #E_FNOPATH
+err	jmp replyerr
+	.)
+
+/**************************************************************************
+ * reading
+ */
+
+do_rd	.(
+l	ldy #FT_POS+1		; buffer empty?
+	lda (fz),y
+	ldy #FT_LEN+1
+	cmp (fz),y
+	bcc have
+	ldy #FT_POS
+	lda (fz),y
+	ldy #FT_LEN
+	cmp (fz),y
+	bcc have
+	jsr rd_next
+	bcc l
+	beq eof
+	; error
+	ldy #FT_STR
+	lda (fz),y
+	tax
+	lda #SC_SSTAT
+	ldy #SCE_WERRM
+	jsr STRCMD
+eof	ldy #FT_STR
+	lda (fz),y
+	tax
+	lda #SC_EOF
+	jsr STRCMD
+	jmp ffree
+
+have	ldy #FT_POS+1
+	lda (fz),y
+	clc
+	adc bp+1
+	sta tp+1
+	lda bp
+	sta tp
+	ldy #FT_POS
+	lda (fz),y
+	tay
+	lda (tp),y
+	pha
+	ldy #FT_STR
+	lda (fz),y
+	tax
+	pla
+	jsr PUTC
+	bcs full
+	ldy #FT_POS
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	bcc l
+	iny
+	lda (fz),y
+	adc #0
+	sta (fz),y
+	jmp l
+full	cmp #E_NUL		; nobody reads any more
+	bne ret
+	jmp eof
+ret	rts
+	.)
+
+	/* next sector of the file into the buffer.
+	   c=0 ok, c=1 z=1 end of file, c=1 z=0 error */
+rd_next	.(
+	ldy #FT_LEFT
+	lda (fz),y
+	iny
+	ora (fz),y
+	iny
+	ora (fz),y
+	iny
+	ora (fz),y
+	bne more
+	sec
+	rts			; z=1
+more	ldy #FT_CLUS
+	ldx #0
+c0	lda (fz),y
+	sta acc,x
+	iny
+	inx
+	cpx #4
+	bcc c0
+	jsr iseoc		; a cluster at all?
+	bcc brx8
+	jmp err
+brx8
+	ldy #FT_SEC
+	lda (fz),y
+	cmp #$ff
+	beq first
+	clc
+	adc #1
+	cmp spc
+	bcc same
+	; next cluster, acc has the current one
+	jsr fat_get
+	bcc brx7
+	jmp err
+brx7
+	jsr iseoc
+	bcs err
+	ldy #FT_CLUS
+	ldx #0
+c2	lda acc,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc c2
+first	lda #0
+same	ldy #FT_SEC
+	sta (fz),y
+	jsr fzlba
+	lda bp
+	sta blk_ptr
+	lda bp+1
+	sta blk_ptr+1
+	jsr blk_read
+	bcs err
+	; length: 512 or what is left
+	ldy #FT_LEFT+3
+	lda (fz),y
+	dey
+	ora (fz),y
+	bne full
+	dey
+	lda (fz),y
+	cmp #2
+	bcs full
+	; less than 512 left
+	ldy #FT_LEFT
+	lda (fz),y
+	ldy #FT_LEN
+	sta (fz),y
+	ldy #FT_LEFT+1
+	lda (fz),y
+	ldy #FT_LEN+1
+	sta (fz),y
+	lda #0
+	ldy #FT_LEFT
+	sta (fz),y
+	iny
+	sta (fz),y
+	jmp pos0
+full	lda #0
+	ldy #FT_LEN
+	sta (fz),y
+	lda #2
+	iny
+	sta (fz),y
+	ldy #FT_LEFT+1		; left -= 512
+	lda (fz),y
+	sec
+	sbc #2
+	sta (fz),y
+	iny
+	lda (fz),y
+	sbc #0
+	sta (fz),y
+	iny
+	lda (fz),y
+	sbc #0
+	sta (fz),y
+pos0	lda #0
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+	clc
+	rts
+err	lda #1			; z=0
+	sec
+	rts
+	.)
+
+	/* slba = blk_lba = sector FT_SEC of cluster FT_CLUS */
+fzlba	.(
+	ldy #FT_CLUS
+	ldx #0
+l	lda (fz),y
+	sta acc,x
+	iny
+	inx
+	cpx #4
+	bcc l
+	jsr clus2lba
+	ldy #FT_SEC
+	lda (fz),y
+	clc
+	adc slba
+	sta slba
+	bcc c
+	inc slba+1
+	bne c
+	inc slba+2
+	bne c
+	inc slba+3
+c	jmp blkset
+	.)
+
+/**************************************************************************
+ * directory listing
+ */
+
+do_dir	.(
+l	ldy #FT_OIDX		; anything left to send?
+	lda (fz),y
+	ldy #FT_OLEN
+	cmp (fz),y
+	bcs make
+	clc
+	adc #FT_OBUF
+	tay
+	lda (fz),y
+	pha
+	ldy #FT_STR
+	lda (fz),y
+	tax
+	pla
+	jsr PUTC
+	bcs full
+	ldy #FT_OIDX
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	jmp l
+full	cmp #E_NUL
+	bne brx6
+	jmp end
+brx6
+	rts
+
+make	lda #0
+	ldy #FT_OIDX
+	sta (fz),y
+	ldy #FT_OLEN
+	sta (fz),y
+	ldy #FT_PHASE
+	lda (fz),y
+	bne p1
+	; the name of the disk
+	lda #1
+	sta (fz),y
+	jsr objclr
+	lda #FS_DIR_MOD_NAM
+	ldy #FT_OBUF+FS_DIR_MODE
+	sta (fz),y
+	ldx #0
+	ldy #FT_OBUF+FS_DIR_NAME
+n1	lda vlabel,x
+	sta (fz),y
+	iny
+	inx
+	cpx #11
+	bcc n1
+	jsr trim
+	jmp l
+
+p1	cmp #1
+	bne p2
+	jsr nextent		; the next matching entry
+	bcc l
+	ldy #FT_PHASE		; none left
+	lda #2
+	sta (fz),y
+	lda freecl+3
+	and freecl+2
+	and freecl+1
+	and freecl
+	cmp #$ff
+	bne brx19			; unknown
+	jmp l
+brx19
+	jsr objclr
+	lda #FS_DIR_MOD_FRE
+	ldy #FT_OBUF+FS_DIR_MODE
+	sta (fz),y
+	; bytes = clusters << (9 + spcsh), at most $ffffffff
+	CP32(tmp, freecl)
+	lda spcsh
+	clc
+	adc #9
+	tax
+sh	asl tmp
+	rol tmp+1
+	rol tmp+2
+	rol tmp+3
+	bcs over
+	dex
+	bne sh
+	beq put
+over	lda #$ff
+	sta tmp
+	sta tmp+1
+	sta tmp+2
+	sta tmp+3
+put	ldx #0
+	ldy #FT_OBUF+FS_DIR_LEN
+pl	lda tmp,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc pl
+	lda #FS_DIR_NAME+1
+	ldy #FT_OLEN
+	sta (fz),y
+	jmp l
+
+p2	; done
+end	ldy #FT_STR
+	lda (fz),y
+	tax
+	lda #SC_EOF
+	jsr STRCMD
+	jmp ffree
+	.)
+
+	/* clear the entry buffer */
+objclr	.(
+	lda #0
+	ldy #FT_OBUF
+l	sta (fz),y
+	iny
+	cpy #FT_OBUF+24
+	bcc l
+	rts
+	.)
+
+	/* strip the trailing blanks of the name at FT_OBUF+FS_DIR_NAME
+	   (11 characters), make it lower case, set FT_OLEN */
+trim	.(
+	ldy #FT_OBUF+FS_DIR_NAME+11
+l	dey
+	cpy #FT_OBUF+FS_DIR_NAME-1
+	beq e
+	lda (fz),y
+	cmp #" "
+	beq l
+e	iny
+	lda #0
+	sta (fz),y
+	iny
+	tya
+	sec
+	sbc #FT_OBUF
+	ldy #FT_OLEN
+	sta (fz),y
+	rts
+	.)
+
+	/* find the next entry that matches, format it into FT_OBUF;
+	   c=1 when there is none */
+nextent	.(
+	ldy #FT_CLUS		; the walk state from the file
+	ldx #0
+l0	lda (fz),y
+	sta dclus,x
+	iny
+	inx
+	cpx #4
+	bcc l0
+	lda (fz),y		; FT_SEC
+	sta dsec
+	iny
+	lda (fz),y
+	sta doff
+	iny
+	lda (fz),y
+	sta doff+1
+
+l	jsr dcur
+	bcs end
+	ldy #0
+	lda (ep),y
+	beq end
+	cmp #$e5
+	beq skip
+	cmp #"."
+	beq skip
+	ldy #$0b
+	lda (ep),y
+	and #$0f
+	cmp #$0f
+	beq skip		; long name
+	lda (ep),y
+	and #$0a
+	bne skip		; volume label, hidden (like ._ files from Macs)
+	ldy #0			; pattern
+m	sty tmp
+	tya
+	clc
+	adc #FT_PAT
+	tay
+	lda (fz),y
+	ldy tmp
+	cmp #"?"
+	beq mok
+	cmp (ep),y
+	bne skip
+mok	iny
+	cpy #11
+	bcc m
+	jsr format
+	jsr dnext		; next time the one after
+	jsr save
+	clc
+	rts
+
+skip	jsr dnext
+	bcc l
+end	jsr save
+	sec
+	rts
+
+save	ldy #FT_CLUS
+	ldx #0
+s	lda dclus,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc s
+	lda dsec
+	sta (fz),y
+	iny
+	lda doff
+	sta (fz),y
+	iny
+	lda doff+1
+	sta (fz),y
+	rts
+	.)
+
+	/* the entry at ep into FT_OBUF */
+format	.(
+	jsr objclr
+	ldy #$0b
+	lda (ep),y
+	and #$10
+	beq file
+	lda #FS_DIR_MOD_DIR
+	ldy #FT_OBUF+FS_DIR_MODE
+	sta (fz),y
+	bne date
+file	ldx #0			; size
+	ldy #$1c
+s	lda (ep),y
+	sty tmp
+	pha
+	txa
+	clc
+	adc #FT_OBUF+FS_DIR_LEN
+	tay
+	pla
+	sta (fz),y
+	ldy tmp
+	iny
+	inx
+	cpx #4
+	bcc s
+date	ldy #$18		; date: yyyyyyym mmmddddd
+	lda (ep),y
+	sta tmp
+	iny
+	lda (ep),y
+	sta tmp+1
+	lsr
+	clc
+	adc #80			; since 1900
+	ldy #FT_OBUF+FS_DIR_YEAR
+	sta (fz),y
+	lda tmp
+	and #$1f
+	ldy #FT_OBUF+FS_DIR_DAY
+	sta (fz),y
+	lda tmp+1
+	lsr
+	lda tmp
+	ror
+	lsr
+	lsr
+	lsr
+	lsr
+	and #$0f
+	ldy #FT_OBUF+FS_DIR_MONTH
+	sta (fz),y
+	ldy #$16		; time: hhhhhmmm mmmsssss
+	lda (ep),y
+	sta tmp
+	iny
+	lda (ep),y
+	sta tmp+1
+	lsr
+	lsr
+	lsr
+	ldy #FT_OBUF+FS_DIR_HOUR
+	sta (fz),y
+	lda tmp
+	and #$1f
+	asl
+	ldy #FT_OBUF+FS_DIR_SEC
+	sta (fz),y
+	lda tmp+1
+	and #7
+	sta tmp+2
+	lda tmp
+	lsr tmp+2
+	ror
+	lsr tmp+2
+	ror
+	lsr tmp+2
+	ror
+	lsr
+	lsr
+	ldy #FT_OBUF+FS_DIR_MIN
+	sta (fz),y
+	/* the name: 8.3 to "name.ext", lower case */
+	ldx #0			; source
+	lda #FT_OBUF+FS_DIR_NAME
+	sta tmp			; destination
+b	txa
+	tay
+	lda (ep),y
+	cmp #" "
+	beq bend
+	jsr lower
+	cpx #0
+	bne b1
+	cmp #$05		; stands for $e5
+	bne b1
+	lda #$e5
+b1	jsr put
+	inx
+	cpx #8
+	bcc b
+bend	ldy #8
+	lda (ep),y
+	cmp #" "
+	beq nend
+	lda #"."
+	jsr put
+	ldx #8
+x	txa
+	tay
+	lda (ep),y
+	cmp #" "
+	beq nend
+	jsr lower
+	jsr put
+	inx
+	cpx #11
+	bcc x
+nend	lda #0
+	jsr put
+	lda tmp
+	sec
+	sbc #FT_OBUF
+	ldy #FT_OLEN
+	sta (fz),y
+	rts
+
+put	ldy tmp
+	sta (fz),y
+	inc tmp
+	rts
+	.)
+
+lower	.(
+	cmp #"A"
+	bcc l
+	cmp #"Z"+1
+	bcs l
+	ora #$20
+l	rts
+	.)
+
+/**************************************************************************
+ * writing
+ */
+
+do_wr	.(
+l	ldy #FT_POS+1		; buffer full?
+	lda (fz),y
+	cmp #2
+	bcc room
+	jsr wr_flush
+	bcs err
+	ldy #FT_SEC		; on to the next sector
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	lda #0
+	ldy #FT_POS
+	sta (fz),y
+	iny
+	sta (fz),y
+room	ldy #FT_STR
+	lda (fz),y
+	tax
+	jsr GETC
+	bcs nochar
+	pha
+	ldy #FT_POS+1
+	lda (fz),y
+	clc
+	adc bp+1
+	sta tp+1
+	lda bp
+	sta tp
+	ldy #FT_POS
+	lda (fz),y
+	tay
+	pla
+	sta (tp),y
+	ldy #FT_POS
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	iny
+	lda (fz),y
+	adc #0
+	sta (fz),y
+	ldy #FT_LEFT		; the size
+	lda (fz),y
+	clc
+	adc #1
+	sta (fz),y
+	bcc l
+	iny
+	lda (fz),y
+	adc #0
+	sta (fz),y
+	iny
+	lda (fz),y
+	adc #0
+	sta (fz),y
+	iny
+	lda (fz),y
+	adc #0
+	sta (fz),y
+	jmp l
+
+nochar	cmp #E_EOF		; the writer is done
+	bne ret
+	jsr wr_close
+	bcs err
+	jmp close
+err	ldy #FT_STR
+	lda (fz),y
+	tax
+	lda #SC_SSTAT
+	ldy #SCE_RERRM
+	jsr STRCMD
+	jsr cache_flush
+close	ldy #FT_STR
+	lda (fz),y
+	tax
+	lda #SC_NUL
+	jsr STRCMD
+	jmp ffree
+ret	rts
+	.)
+
+	/* write the buffer to where FT_CLUS/FT_SEC say, allocating */
+wr_flush .(
+	ldy #FT_SEC
+	lda (fz),y
+	cmp #$ff
+	bne notfirst
+	ZERO32(acc)		; the first cluster of the file
+	jsr alloc
+	bcs err
+	ldy #FT_FIRST
+	ldx #0
+f	lda acc,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc f
+	jmp newcl
+notfirst cmp spc
+	bcc write
+	ldy #FT_CLUS		; cluster full, chain a new one
+	ldx #0
+c	lda (fz),y
+	sta acc,x
+	iny
+	inx
+	cpx #4
+	bcc c
+	jsr alloc
+	bcs err
+newcl	ldy #FT_CLUS
+	ldx #0
+n	lda acc,x
+	sta (fz),y
+	iny
+	inx
+	cpx #4
+	bcc n
+	lda #0
+	ldy #FT_SEC
+	sta (fz),y
+write	jsr fzlba
+	lda bp
+	sta blk_ptr
+	lda bp+1
+	sta blk_ptr+1
+	jmp blk_write
+err	rts
+	.)
+
+	/* the rest of the buffer, and the directory entry */
+wr_close .(
+	ldy #FT_POS
+	lda (fz),y
+	iny
+	ora (fz),y
+	beq nobuf
+	jsr wr_flush
+	bcs err
+nobuf	ldy #FT_ELBA
+	ldx #0
+e	lda (fz),y
+	sta e_lba,x
+	iny
+	inx
+	cpx #4
+	bcc e
+	lda (fz),y
+	sta e_off
+	iny
+	lda (fz),y
+	sta e_off+1
+	jsr entry_get
+	bcs err
+	ldy #FT_FIRST
+	ldx #0
+f	lda (fz),y
+	sta acc,x
+	iny
+	inx
+	cpx #4
+	bcc f
+	jsr setclus
+	ldx #0			; size
+	ldy #FT_LEFT
+s	lda (fz),y
+	sty tmp
+	pha
+	txa
+	clc
+	adc #$1c
+	tay
+	pla
+	sta (ep),y
+	ldy tmp
+	iny
+	inx
+	cpx #4
+	bcc s
+	jsr stamp
+	ldy #$0b
+	lda (ep),y
+	ora #$20		; archive
+	sta (ep),y
+	inc cdirty
+	jsr cache_flush
+	bcs err
+	jmp fsinfo_put
+err	rts
+	.)
+
+	/* cluster acc into the entry at ep */
+setclus	.(
+	ldy #$1a
+	lda acc
+	sta (ep),y
+	iny
+	lda acc+1
+	sta (ep),y
+	ldy #$14
+	lda acc+2
+	sta (ep),y
+	iny
+	lda acc+3
+	sta (ep),y
+	rts
+	.)
+
+	/* creation, write and access date of the entry at ep */
+stamp	.(
+	ldy #$0e
+	jsr one
+	ldy #$16
+	jsr one
+	ldy #$12
+	lda #<FSFAT32_DATE
+	sta (ep),y
+	iny
+	lda #>FSFAT32_DATE
+	sta (ep),y
+	rts
+one	lda #<FSFAT32_TIME
+	sta (ep),y
+	iny
+	lda #>FSFAT32_TIME
+	sta (ep),y
+	iny
+	lda #<FSFAT32_DATE
+	sta (ep),y
+	iny
+	lda #>FSFAT32_DATE
+	sta (ep),y
+	rts
+	.)
+
+/*
+ * new entry name83 with attribute AC in directory pclus, in the free
+ * slot the last lookup found, or in a new cluster of the directory.
+ * The entry is left in e_lba/e_off, empty.
+ */
+mkentry	.(
+	sta mkattr
+	lda f_have
+	bne have
+	CP32(acc, dlast)	; extend the directory
+	jsr alloc
+	bcs err
+	CP32(ftmp2, acc)
+	jsr zerocl
+	bcs err
+	CP32(acc, ftmp2)
+	jsr clus2lba
+	CP32(f_lba, slba)
+	lda #0
+	sta f_off
+	sta f_off+1
+have	CP32(e_lba, f_lba)
+	lda f_off
+	sta e_off
+	lda f_off+1
+	sta e_off+1
+	jsr entry_get
+	bcs err
+	ldy #31
+	lda #0
+z	sta (ep),y
+	dey
+	bpl z
+	ldy #10
+n	lda name83,y
+	sta (ep),y
+	dey
+	bpl n
+	ldy #$0b
+	lda mkattr
+	sta (ep),y
+	jsr stamp
+	inc cdirty
+	jmp cache_flush
+err	rts
+	.)
+
+	/* the sector of the found entry into the cache, ep to it */
+entry_get .(
+	CP32(slba, e_lba)
+	jsr cache_get
+	bcs err
+	lda #<cache
+	clc
+	adc e_off
+	sta ep
+	lda #>cache
+	adc e_off+1
+	sta ep+1
+err	rts
+	.)
+
+	/* mark the entry at ep, and its long name entries, deleted */
+delent	.(
+	ldy #0
+	lda #$e5
+	sta (ep),y
+	inc cdirty
+&dellfn	lda ep			; long name entries go backwards
+	sta tp
+	lda ep+1
+	sta tp+1
+l	lda tp
+	cmp #<cache
+	bne back
+	lda tp+1
+	cmp #>cache
+	beq end
+back	lda tp
+	sec
+	sbc #32
+	sta tp
+	bcs b
+	dec tp+1
+b	ldy #$0b
+	lda (tp),y
+	cmp #$0f
+	bne end
+	ldy #0
+	lda (tp),y
+	cmp #$e5
+	beq end
+	lda #$e5
+	sta (tp),y
+	inc cdirty
+	jmp l
+end	rts
+	.)
+
+/**************************************************************************
+ * clusters
+ */
+
+	/* c=1 if acc is not a cluster of a chain (end, free, bad, too big) */
+iseoc	.(
+	lda acc+3
+	and #$0f
+	sta acc+3
+	CMP32(acc, maxclus)
+	bcs no
+	lda acc+3
+	ora acc+2
+	ora acc+1
+	bne yes
+	lda acc
+	cmp #2
+	bcc no
+yes	clc
+	rts
+no	sec
+	rts
+	.)
+
+	/* slba = sector of cluster acc */
+clus2lba .(
+	lda acc
+	sec
+	sbc #2
+	sta slba
+	lda acc+1
+	sbc #0
+	sta slba+1
+	lda acc+2
+	sbc #0
+	sta slba+2
+	lda acc+3
+	sbc #0
+	sta slba+3
+	ldx spcsh
+	beq add
+l	asl slba
+	rol slba+1
+	rol slba+2
+	rol slba+3
+	dex
+	bne l
+add	ADD32(slba, datalba)
+	rts
+	.)
+
+	/* the FAT sector with the entry of cluster acc into the cache,
+	   tp pointing to the entry */
+fatloc	.(
+	lda acc			; sector: acc >> 7
+	asl
+	lda acc+1
+	rol
+	sta slba
+	lda acc+2
+	rol
+	sta slba+1
+	lda acc+3
+	rol
+	sta slba+2
+	lda #0
+	rol
+	sta slba+3
+	ADD32(slba, fatlba)
+	jsr cache_get
+	bcs err
+	lda #1
+	sta cfat
+	lda acc			; offset: (acc & 127) * 4
+	and #$7f
+	asl
+	asl
+	sta tp
+	lda #0
+	rol
+	sta tp+1
+	lda tp
+	clc
+	adc #<cache
+	sta tp
+	lda tp+1
+	adc #>cache
+	sta tp+1
+	clc
+err	rts
+	.)
+
+	/* acc = FAT entry of cluster acc */
+fat_get	.(
+	jsr fatloc
+	bcs err
+	ldy #3
+l	lda (tp),y
+	sta acc,y
+	dey
+	bpl l
+	lda acc+3
+	and #$0f
+	sta acc+3
+	clc
+err	rts
+	.)
+
+	/* FAT entry of cluster acc = fval */
+fat_set	.(
+	jsr fatloc
+	bcs err
+	ldy #0
+l	lda fval,y
+	sta (tp),y
+	iny
+	cpy #3
+	bcc l
+	lda (tp),y		; the upper four bits are reserved
+	and #$f0
+	ora fval+3
+	sta (tp),y
+	inc cdirty
+	clc
+err	rts
+	.)
+
+	/* free the chain starting at acc */
+freechain .(
+l	jsr iseoc
+	bcs done
+	CP32(ftmp, acc)
+	jsr fat_get
+	bcs err
+	CP32(ftmp2, acc)
+	CP32(acc, ftmp)
+	ZERO32(fval)
+	jsr fat_set
+	bcs err
+	lda freecl		; one more free, if we know
+	and freecl+1
+	and freecl+2
+	and freecl+3
+	cmp #$ff
+	beq unk
+	INC32(freecl)
+unk	CP32(acc, ftmp2)
+	jmp l
+done	jmp cache_flush
+err	rts
+	.)
+
+	/* a free cluster, chained to acc (if not 0), marked as end of chain;
+	   returned in acc */
+alloc	.(
+	CP32(aprev, acc)
+	CP32(acc, nxtfree)
+	jsr iseoc		; a usable hint?
+	bcc hint
+	lda #2
+	sta acc
+	lda #0
+	sta acc+1
+	sta acc+2
+	sta acc+3
+hint	CP32(astart, acc)
+l	CP32(acur, acc)
+	jsr fat_get
+	bcs err
+	lda acc
+	ora acc+1
+	ora acc+2
+	ora acc+3
+	beq found
+	CP32(acc, acur)		; next one
+	INC32(acc)
+	CMP32(acc, maxclus)
+	bcc n2
+	lda #2
+	sta acc
+	lda #0
+	sta acc+1
+	sta acc+2
+	sta acc+3
+n2	EQ32(acc, astart)	; round?
+	bne l
+	lda #E_FDISKFULL
+	sec
+err	rts
+
+found	CP32(acc, acur)
+	lda #$ff
+	sta fval
+	sta fval+1
+	sta fval+2
+	lda #$0f
+	sta fval+3
+	jsr fat_set
+	bcs err
+	lda aprev
+	ora aprev+1
+	ora aprev+2
+	ora aprev+3
+	beq nolink
+	CP32(fval, acur)
+	CP32(acc, aprev)
+	jsr fat_set
+	bcs err
+nolink	lda freecl
+	and freecl+1
+	and freecl+2
+	and freecl+3
+	cmp #$ff
+	beq unk
+	DEC32(freecl)
+unk	CP32(acc, acur)
+	CP32(nxtfree, acur)
+	INC32(nxtfree)
+	clc
+	rts
+	.)
+
+	/* fill cluster acc with zeros, leaves the cache invalid */
+zerocl	.(
+	jsr cache_flush
+	bcs err
+	lda #0
+	sta cvalid
+	tay
+l	sta cache,y
+	sta cache+256,y
+	iny
+	bne l
+	jsr clus2lba
+	lda spc
+	sta cnt
+w	jsr blkset
+	lda #<cache
+	sta blk_ptr
+	lda #>cache
+	sta blk_ptr+1
+	jsr blk_write
+	bcs err
+	INC32(slba)
+	dec cnt
+	bne w
+	clc
+err	rts
+	.)
+
+	/* write free count and hint back into the FSInfo sector */
+fsinfo_put .(
+	lda fsinfo
+	ora fsinfo+1
+	ora fsinfo+2
+	ora fsinfo+3
+	beq none
+	CP32(slba, fsinfo)
+	jsr cache_get
+	bcs err
+	ldx #3
+l	lda freecl,x
+	sta cache+$1e8,x
+	lda nxtfree,x
+	sta cache+$1ec,x
+	dex
+	bpl l
+	inc cdirty
+	jmp cache_flush
+none	clc
+err	rts
+	.)
+
+/**************************************************************************
+ * the sector cache
+ */
+
+	/* sector slba into the cache */
+cache_get .(
+	lda cvalid
+	beq load
+	ldx #3
+c	lda slba,x
+	cmp clba,x
+	bne load
+	dex
+	bpl c
+	clc
+	rts
+load	jsr cache_flush
+	bcs err
+	lda #0
+	sta cvalid
+	sta cfat
+	jsr blkset
+	lda #<cache
+	sta blk_ptr
+	lda #>cache
+	sta blk_ptr+1
+	jsr blk_read
+	bcs err
+	CP32(clba, slba)
+	lda #1
+	sta cvalid
+	clc
+err	rts
+	.)
+
+	/* write the cache back if it was changed; FAT sectors go to
+	   every copy of the FAT */
+cache_flush .(
+	lda cdirty
+	beq ok
+	lda cvalid
+	beq ok
+	CP32(wlba, clba)
+	lda nfats
+	sta fcnt
+l	ldx #3
+bl	lda wlba,x
+	sta blk_lba,x
+	dex
+	bpl bl
+	lda #<cache
+	sta blk_ptr
+	lda #>cache
+	sta blk_ptr+1
+	jsr blk_write
+	bcs err
+	lda cfat
+	beq done
+	dec fcnt
+	beq done
+	ADD32(wlba, fatsz)
+	jmp l
+done	lda #0
+	sta cdirty
+ok	clc
+err	rts
+	.)
+
+/**************************************************************************
+ * directories
+ */
+
+	/* start walking directory acc (0: root) */
+dinit	.(
+	lda acc
+	ora acc+1
+	ora acc+2
+	ora acc+3
+	bne n
+	CP32(acc, root)
+n	CP32(dclus, acc)
+	CP32(dlast, acc)
+	lda #0
+	sta dsec
+	sta doff
+	sta doff+1
+	rts
+	.)
+
+	/* ep = the current entry, c=1 on error */
+dcur	.(
+	CP32(acc, dclus)
+	jsr clus2lba
+	lda dsec
+	clc
+	adc slba
+	sta slba
+	bcc c
+	inc slba+1
+	bne c
+	inc slba+2
+	bne c
+	inc slba+3
+c	jsr cache_get
+	bcs err
+	lda #<cache
+	clc
+	adc doff
+	sta ep
+	lda #>cache
+	adc doff+1
+	sta ep+1
+err	rts
+	.)
+
+	/* on to the next entry, c=1 at the end of the chain */
+dnext	.(
+	lda doff
+	clc
+	adc #32
+	sta doff
+	bcc same
+	inc doff+1
+	lda doff+1
+	cmp #2
+	bcc same
+	lda #0
+	sta doff+1
+	inc dsec
+	lda dsec
+	cmp spc
+	bcc same
+	lda #0
+	sta dsec
+	CP32(acc, dclus)
+	jsr fat_get
+	bcs end
+	jsr iseoc
+	bcs end
+	CP32(dclus, acc)
+	CP32(dlast, acc)
+same	clc
+	rts
+end	sec
+	rts
+	.)
+
+/*
+ * search directory cur for name83. c=0: found, e_* set. c=1 not found,
+ * and f_have/f_lba/f_off tell a free slot, dlast the last cluster.
+ */
+dsearch	.(
+	lda #0
+	sta f_have
+	CP32(acc, cur)
+	jsr dinit
+l	jsr dcur
+	bcs err
+	ldy #0
+	lda (ep),y
+	beq free		; the end
+	cmp #$e5
+	beq del
+	ldy #$0b
+	lda (ep),y
+	and #$0f
+	cmp #$0f
+	beq next		; long name
+	lda (ep),y
+	and #$08
+	bne next		; volume label
+	ldy #10
+c	lda (ep),y
+	cmp name83,y
+	bne next
+	dey
+	bpl c
+	; found
+	ldy #$0b
+	lda (ep),y
+	sta e_attr
+	ldy #$1a
+	lda (ep),y
+	sta e_clus
+	iny
+	lda (ep),y
+	sta e_clus+1
+	ldy #$14
+	lda (ep),y
+	sta e_clus+2
+	iny
+	lda (ep),y
+	sta e_clus+3
+	ldy #$1c
+	ldx #0
+s	lda (ep),y
+	sta e_size,x
+	iny
+	inx
+	cpx #4
+	bcc s
+	CP32(e_lba, slba)
+	lda doff
+	sta e_off
+	lda doff+1
+	sta e_off+1
+	clc
+	rts
+del	jsr slot
+next	jsr dnext
+	bcc l
+	lda #E_FNOFIL		; end of the chain
+	sec
+	rts
+free	jsr slot
+	lda #E_FNOFIL
+err	sec
+	rts
+
+slot	lda f_have
+	bne sx
+	inc f_have
+	CP32(f_lba, slba)
+	lda doff
+	sta f_off
+	lda doff+1
+	sta f_off+1
+sx	rts
+	.)
+
+/*
+ * np -> name83, np moved behind the name. c=1 when it does not fit.
+ * make83y does the same, starting at (np),y
+ */
+make83	ldy #0
+make83y	.(
+	ldx #10
+	lda #" "
+cl	sta name83,x
+	dex
+	bpl cl
+	lda (np),y		; "." and ".."
+	cmp #"."
+	bne base
+	sta name83
+	iny
+	lda (np),y
+	cmp #"."
+	bne dot1
+	sta name83+1
+	iny
+	lda (np),y
+dot1	beq done
+	cmp #DIRSIGN
+	beq done
+	sec
+	rts
+base	ldx #0
+	stx star
+bl	lda (np),y
+	beq done
+	cmp #DIRSIGN
+	beq done
+	iny
+	cmp #"."
+	beq ext
+	cmp #"*"
+	beq bstar
+	cpx #8
+	bcs bad
+	jsr upper
+	sta name83,x
+	inx
+	bne bl
+bstar	lda #"?"
+	sta star		; "*" alone matches any extension too
+bs	cpx #8
+	bcs bl
+	sta name83,x
+	inx
+	bne bs
+ext	cpx #0
+	beq bad
+	ldx #0
+	stx star
+	ldx #8
+el	lda (np),y
+	beq done
+	cmp #DIRSIGN
+	beq done
+	iny
+	cmp #"*"
+	beq estar
+	cpx #11
+	bcs bad
+	jsr upper
+	sta name83,x
+	inx
+	bne el
+estar	lda #"?"
+es	cpx #11
+	bcs el
+	sta name83,x
+	inx
+	bne es
+done	lda star
+	beq nostar
+	sta name83+8
+	sta name83+9
+	sta name83+10
+nostar	cpx #0			; no name at all?
+	beq chkdot
+ok	tya
+	clc
+	adc np
+	sta np
+	bcc c
+	inc np+1
+c	clc
+	rts
+chkdot	lda name83
+	cmp #"."
+	beq ok
+bad	sec
+	rts
+	.)
+
+upper	.(
+	cmp #"a"
+	bcc u
+	cmp #"z"+1
+	bcs u
+	and #$df
+u	rts
+	.)
+
+	/* skip "/" at np */
+skipsl	.(
+	ldy #0
+	lda (np),y
+	cmp #DIRSIGN
+	bne e
+	inc np
+	bne skipsl
+	inc np+1
+	bne skipsl
+e	rts
+	.)
+
+/*
+ * look up the path at np. c=0: found, e_* describe it (the root is
+ * a directory with cluster root and no entry). c=1: ac = E_FNOFIL when
+ * only the last part is missing - then pclus is its directory and
+ * name83 its name - else E_FNOPATH or E_FNAMLEN.
+ */
+lookup	.(
+	CP32(cur, root)
+	CP32(pclus, root)
+	jsr skipsl
+	ldy #0
+	lda (np),y
+	bne l
+	lda #$10		; the root itself
+	sta e_attr
+	CP32(e_clus, root)
+	clc
+	rts
+l	jsr make83
+	bcs badname
+	CP32(pclus, cur)
+	jsr dsearch
+	bcs notfound
+	jsr skipsl
+	ldy #0
+	lda (np),y
+	beq found
+	lda e_attr		; more to come - has to be a directory
+	and #$10
+	beq nopath
+	CP32(cur, e_clus)
+	lda cur
+	ora cur+1
+	ora cur+2
+	ora cur+3
+	bne l
+	CP32(cur, root)		; ".." to the root
+	jmp l
+found	lda e_clus		; ".." of the first level is 0
+	ora e_clus+1
+	ora e_clus+2
+	ora e_clus+3
+	bne ok
+	lda e_attr
+	and #$10
+	beq ok
+	CP32(e_clus, root)
+ok	clc
+	rts
+notfound cmp #E_FNOFIL
+	bne err
+	jsr skipsl
+	ldy #0
+	lda (np),y
+	beq last
+nopath	lda #E_FNOPATH
+	.byt $2c
+badname	lda #E_FNAMLEN
+	sec
+err	rts
+last	lda #E_FNOFIL
+	sec
+	rts
+	.)
+
+/**************************************************************************
+ * mounting
+ */
+
+	/* make sure the medium is mounted - and still the same one */
+chkmount .(
+	lda mounted
+	beq mount
+	lda nopen
+	bne ok
+	lda #0			; read the boot sector again
+	sta cvalid
+	CP32(slba, part)
+	jsr cache_get
+	bcs mount
+	ldx #3
+l	lda cache+$43,x
+	cmp serial,x
+	bne mount
+	dex
+	bpl l
+ok	clc
+	rts
+	.)
+
+mount	.(
+	lda #0
+	sta mounted
+	sta cvalid
+	sta cdirty
+	jsr blk_init
+	bcc brx5
+	jmp nodrv
+brx5
+	ZERO32(part)
+	ZERO32(slba)
+	jsr cache_get
+	bcc brx4
+	jmp nodrv
+brx4
+	jsr isvbr
+	bcc vbr
+	ldx #0			; MBR: the first FAT32 partition
+p	lda cache+$1be+4,x
+	cmp #$0b
+	beq pfound
+	cmp #$0c
+	beq pfound
+	txa
+	clc
+	adc #16
+	tax
+	cpx #64
+	bcc p
+	bcc brx3
+	jmp nodrv
+brx3
+pfound	ldy #0
+p1	lda cache+$1be+8,x
+	sta part,y
+	sta slba,y
+	inx
+	iny
+	cpy #4
+	bcc p1
+	jsr cache_get
+	bcc brx2
+	jmp nodrv
+brx2
+	jsr isvbr
+	bcc brx1
+	jmp nodrv
+brx1
+
+vbr	lda cache+$0d		; sectors per cluster
+	sta spc
+	ldx #0
+sh	lsr
+	bcs shd
+	inx
+	bne sh
+shd	stx spcsh
+	lda cache+$10
+	sta nfats
+	ldx #3
+cp	lda cache+$24,x		; FAT size
+	sta fatsz,x
+	lda cache+$2c,x		; root cluster
+	sta root,x
+	lda cache+$43,x
+	sta serial,x
+	dex
+	bpl cp
+	ldx #10
+vl	lda cache+$47,x
+	sta vlabel,x
+	dex
+	bpl vl
+	; FAT = part + reserved
+	lda part
+	clc
+	adc cache+$0e
+	sta fatlba
+	lda part+1
+	adc cache+$0f
+	sta fatlba+1
+	lda part+2
+	adc #0
+	sta fatlba+2
+	lda part+3
+	adc #0
+	sta fatlba+3
+	; data = FAT + nfats * fatsz
+	CP32(datalba, fatlba)
+	lda nfats
+	sta cnt
+d	ADD32(datalba, fatsz)
+	dec cnt
+	bne d
+	; clusters: (total - (data - part)) >> spcsh, +2
+	CP32(tmp, datalba)
+	ldx #tmp-R
+	ldy #part-R
+	jsr sub32
+	lda cache+$20
+	sec
+	sbc tmp
+	sta maxclus
+	lda cache+$21
+	sbc tmp+1
+	sta maxclus+1
+	lda cache+$22
+	sbc tmp+2
+	sta maxclus+2
+	lda cache+$23
+	sbc tmp+3
+	sta maxclus+3
+	ldx spcsh
+	beq m2
+m1	lsr maxclus+3
+	ror maxclus+2
+	ror maxclus+1
+	ror maxclus
+	dex
+	bne m1
+m2	lda maxclus
+	clc
+	adc #2
+	sta maxclus
+	bcc fi
+	inc maxclus+1
+	bne fi
+	inc maxclus+2
+	bne fi
+	inc maxclus+3
+fi	; FSInfo
+	lda #$ff
+	ldx #3
+f0	sta freecl,x
+	dex
+	bpl f0
+	ZERO32(nxtfree)
+	ZERO32(fsinfo)
+	lda cache+$30
+	ora cache+$31
+	beq done
+	lda part
+	clc
+	adc cache+$30
+	sta slba
+	lda part+1
+	adc cache+$31
+	sta slba+1
+	lda part+2
+	adc #0
+	sta slba+2
+	lda part+3
+	adc #0
+	sta slba+3
+	jsr cache_get
+	bcs done
+	lda cache		; "RRaA"
+	cmp #$52
+	bne done
+	lda cache+$1e4		; "rrAa"
+	cmp #$72
+	bne done
+	CP32(fsinfo, slba)
+	ldx #3
+f1	lda cache+$1e8,x
+	sta freecl,x
+	lda cache+$1ec,x
+	sta nxtfree,x
+	dex
+	bpl f1
+done	lda #1
+	sta mounted
+	clc
+	rts
+nodrv	lda #E_FNODRV
+	sec
+	rts
+
+	/* c=0 if the cache holds a FAT32 boot sector */
+isvbr	lda cache+$1fe
+	cmp #$55
+	bne no
+	lda cache+$1ff
+	cmp #$aa
+	bne no
+	lda cache
+	cmp #$eb
+	beq j
+	cmp #$e9
+	bne no
+j	lda cache+$0b		; 512 bytes per sector
+	bne no
+	lda cache+$0c
+	cmp #2
+	bne no
+	lda cache+$16		; no 16 bit FAT size: FAT32
+	ora cache+$17
+	bne no
+	lda cache+$0d		; sectors per cluster
+	beq no
+	lda cache+$10		; FATs
+	beq no
+	clc
+	rts
+no	sec
+	rts
+	.)
+
+ende	.)
+

@@ -364,6 +364,9 @@ noerr	lda #0
 	jsr STRCMD
 	lda #SC_EOF
 	jsr STRCMD
+	; let the parent go on first, so that what it prints about the
+	; start comes before what the new program prints
+	jsr YIELD
 
 	; store exec address
 	pla		; YR from doload
