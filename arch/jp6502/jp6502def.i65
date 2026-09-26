@@ -68,7 +68,7 @@
 #endif
 #define	SN_HIGH_HZ	880	/* start, end of boot, console bell */
 #define	SN_LOW_HZ	440	/* hardware error */
-#define	SN_BEEPVOL	8	/* 0 loudest .. 15 off */
+#define	SN_BEEPVOL	0	/* 0 loudest .. 15 off */
 
 #define	BEEP_START_MS	120	/* at reset */
 #define	BEEP_BELL_MS	100	/* end of boot (one), boot error (three),
