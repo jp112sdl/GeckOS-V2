@@ -40,6 +40,10 @@
  *     -R            no clock module: no pull-ups either, and the lines
  *                   keep the last level the VIA gave them (the bus holders
  *                   of the W65C22S)
+ *     -N            no keyboard: the keyboard controller, which tells a
+ *                   second after reset whether it found one, tells $fe
+ *                   instead of $ff (port A floats until then)
+ *     -n            no keyboard controller: it never tells
  *     -x FILE       script, see below; without one the terminal is
  *                   connected to the ACIA (Ctrl-] quits)
  *     -t SECONDS    stop after this much emulated time
@@ -525,6 +529,7 @@ static void vdp_screen(FILE *f)
 
 static u8 *kbq; static size_t kbq_len, kbq_pos;
 static u64 kb_next;
+static int opt_nokbd, opt_nokbc;
 
 static void kbd_queue(const u8 *s, size_t n)
 {
@@ -1750,7 +1755,7 @@ int main(int argc, char **argv)
 	const char *script = NULL, *sdimg = NULL, *labfile = NULL, *rtctime = NULL;
 	double tmax = 0;
 	int o;
-	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:Sk:KR")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:Sk:KRNn")) != -1) {
 		switch (o) {
 		case 'c': clock_mhz = atof(optarg); break;
 		case 's': sdimg = optarg; break;
@@ -1769,8 +1774,10 @@ int main(int argc, char **argv)
 		case 'k': rtctime = optarg; break;
 		case 'K': rtc.stopped = 1; break;
 		case 'R': rtc.present = 0; break;
+		case 'N': opt_nokbd = 1; break;
+		case 'n': opt_nokbc = 1; break;
 		default:
-			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-k time] [-K] [-R] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
+			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-k time] [-K] [-R] [-N] [-n] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
 			return 1;
 		}
 	}
@@ -1791,6 +1798,14 @@ int main(int argc, char **argv)
 	rtc_init(rtctime);
 	for (int i = 0; i < 0x8000; i++) ram[i] = (i * 7 + 13) & 0xff;	/* not zero */
 	reset();
+	/* the keyboard controller is reset with the board; its lines float
+	   (read as $ff here) until it tells, a second later, whether it
+	   found a keyboard */
+	if (!opt_nokbc) {
+		u8 st = opt_nokbd ? 0xfe : 0xff;
+		kbd_queue(&st, 1);
+		kb_next = secs(1.05);
+	}
 
 	if (script) {
 		FILE *sf = fopen(script, "r");
