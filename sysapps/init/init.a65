@@ -43,6 +43,10 @@
  * its output when it has started everything - three when something could
  * not be started.
  *
+ * If INIT_NOSTRERROR is defined, init shows the code a restarted program
+ * ended with in hex only, without its text: that leaves the texts of all
+ * error codes out of the ROM, about 900 bytes.
+ *
  * If INIT_CLOCK is defined (with INIT_VERBOSE), init shows the time after
  * its first line, as YYYY-MM-DD HH:MM:SS. The ROM needs a clock driver
  * for it: clk_get, c=0 when clk_bcd holds seconds, minutes, hours,
@@ -727,10 +731,12 @@ loop	sec	; check for died processes
 	tsx
 	lda $0102,x
 	jsr hexout
+#ifndef INIT_NOSTRERROR
 	jsr spout
 	lda $0102,x
 	jsr strerror
 	jsr strout
+#endif
 	pla
 	tax
 	pla
