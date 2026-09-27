@@ -311,13 +311,14 @@ f	jsr pause
 	jsr lcmd
 	jsr clear
 	ldy #0
-b	lda banner,y
+&&&lcd_text			; the text at banner+YR, from outside too
+	lda banner,y
 	beq e
 	sty sy
 	jsr putch
 	ldy sy
 	iny
-	bne b
+	bne lcd_text
 e	clc
 	rts
 
@@ -332,6 +333,10 @@ p	dey
 	rts
 
 banner	.asc "GeckOS/A65 2.2", 13, 10, "JP6502", 0
+	/* what kbd_check (con_jp.a65) shows here and on the screen */
+nokbd	.asc 13, 10, "No keyboard!", 13, 10, 0
+&&kbd_msg = nokbd
+&&kbd_msgoff = nokbd - banner
 	.)
 
 devend	.)

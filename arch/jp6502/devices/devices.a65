@@ -54,6 +54,8 @@ devstart
 
 /* not a device - used by the kernel and the console */
 #include "devices/snd_jp.a65"
+/* not a device either - used by init */
+#include "devices/kbdchk_jp.a65"
 
 endd	.)
 

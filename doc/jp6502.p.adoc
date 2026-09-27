@@ -101,6 +101,15 @@ is on. After a reset CB2 is an input, pulled up, and the speaker is off,
 so the random tone is not heard; the kernel drives CB2 low once the chip
 is silent. Without that circuit, CB2 is simply unused.
 
+Before init starts anything it checks for the keyboard, as the board's
+OS1 firmware does. The keyboard controller is reset with the board and
+tells about a second later whether it found a keyboard - $ff or $fe,
+sent like a key. init waits for that, up to about 5 s. Without a
+keyboard, or when the controller does not tell, "No keyboard!" is shown
+on the LCD and on the screen, there are three beeps, and nothing is
+started, not the shell on the serial line either. Plug the keyboard in
+and reset.
+
 When everything is started, init sends a bell to the console: one short
 beep. When something could not be started - most likely the shell,
 because there is no card in the slot - there are three, and the reason
@@ -255,7 +264,8 @@ the baud rate whether the CPU keeps up or not and counts the overruns,
 *-I* reports the longest time with interrupts off, *-P* profiles.
 The clock starts at the host's time, or at *-k "2026-09-26 14:30"*;
 *-K* gives a new one that never ran, *-R* none at all ("rtc" prints
-its time).
+its time). *-N* has the keyboard controller report no keyboard, *-n*
+leaves the controller out.
 *emu/fat32img.py* makes FAT32 card images and lists, reads and checks
 them.
 

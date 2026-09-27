@@ -1,0 +1,69 @@
+/****************************************************************************
+
+    OS/A65 Version 2.2
+    Multitasking Operating System for 6502 Computers
+
+    Copyright (C) 1989-2024 Andre Fachat
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+****************************************************************************/
+
+/*
+ * Not a device: the check for the keyboard that init makes at boot
+ * (INIT_CHECK). It comes after the LCD, whose text routine it uses.
+ */
+
+#include "jp6502def.i65"
+
+	.(
+
+	.bss
+kbdt	.byt 0		/* time left */
+	.text
+
+/*
+ * Is there a keyboard? init asks at boot (INIT_CHECK). The controller
+ * is reset with the board, and a second later tells whether it found
+ * one: $ff yes, $fe no, sent like a key, with the handshake. The console
+ * keeps it in kbdstat, and this waits up to about 5 s for it - as OS1
+ * does. Port A itself says nothing before that: until the controller's
+ * program runs, its lines float.
+ * c=1 when there is none, or the controller does not tell: the message
+ * is on the LCD then, and a/y point to it for init.
+ */
+&&kbd_check .(
+	lda #7*CLOCK_MHZ
+	sta kbdt
+l	lda kbdstat		; set in the interrupt
+	bne got
+	dey
+	bne l
+	dex
+	bne l
+	dec kbdt
+	bne l
+got	eor #KBD_CONNECTED	; 0 when there is a keyboard
+	cmp #1
+	bcc ok
+	ldy #kbd_msgoff
+	jsr lcd_text
+	lda #<kbd_msg
+	ldy #>kbd_msg
+	sec
+ok	rts
+	.)
+
+	.)

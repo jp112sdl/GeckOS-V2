@@ -123,6 +123,7 @@ dhi	.word 0		/* offsets into it; dlo > dhi is clean */
 vtmp	.word 0
 vcnt	.word 0
 kbw	.byt 0		/* keyboard ring */
+&kbdstat .byt 0		/* the controller's last status, $ff or $fe */
 kbr	.byt 0
 kbuf	.dsb 16
 crsrfl	.byt 0
@@ -506,7 +507,7 @@ inikbd	.(
 	beq noirq
 	lda VIA3+VIA_DRA	; clears CA1
 	cmp #KBD_DISCONNECTED	; the controller's status codes
-	bcs done
+	bcs stat
 	ldx kbw
 	sta kbuf,x
 	inx
@@ -515,6 +516,8 @@ inikbd	.(
 	cmp kbr
 	beq done		; full - the key is lost
 	sta kbw
+	.byt $2c
+stat	sta kbdstat		; for kbd_check (kbdchk_jp.a65)
 done	lda #E_OK
 	rts
 noirq	lda #E_NOIRQ

@@ -118,6 +118,10 @@ ROMSTART=*
 				   when something could not be */
 #define	INIT_CLOCK		/* the time of the DS3231 after the
 				   first line */
+#define	INIT_CHECK	kbd_check	/* no keyboard: no boot
+					   (devices/kbdchk_jp.a65) */
+#define	INIT_NOSTRERROR		/* a program that ends: its error code
+				   in hex, no text - saves 900 bytes */
 #include  "sysapps/init/init.a65"
 
 #echo after INIT
