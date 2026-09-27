@@ -43,6 +43,9 @@
  * its output when it has started everything - three when something could
  * not be started.
  *
+ * If INIT_QUIETRESTART is defined, init does not say "Prepared restart!"
+ * for each program it will start again when it ends.
+ *
  * If INIT_NOSTRERROR is defined, init shows the code a restarted program
  * ended with in hex only, without its text: that leaves the texts of all
  * error codes out of the ROM, about 900 bytes.
@@ -340,8 +343,10 @@ ok	.)
 	sta pid,y
 	inc npid
 #ifdef INIT_VERBOSE
+#ifndef INIT_QUIETRESTART
 	ldx #9
 	jsr itout
+#endif
 #endif
 #endif
 norestart
@@ -605,7 +610,11 @@ m6	.asc "Couldn't alloc streams!",13,10,0
 #ifdef INIT_RESTART
 m7	.asc 13,10, "Received sigchld from ",0
 m8 	=m7-3	; CRLF
+#ifdef INIT_QUIETRESTART
+m9	=m2		/* not shown */
+#else
 m9	.asc "Prepared restart!",13,10,0
+#endif
 m10	.asc "Could not set device stream!",13,10,0
 m11	.asc 13,10, "Received sigcont from ",0
 #endif
