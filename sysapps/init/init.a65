@@ -47,6 +47,11 @@
  * ended with in hex only, without its text: that leaves the texts of all
  * error codes out of the ROM, about 900 bytes.
  *
+ * If INIT_CHECK is defined (with INIT_VERBOSE) it names a routine init
+ * calls before it starts anything. When it returns c=1, init shows the
+ * text at a/y, starts nothing (with INIT_BELL: three bells) and waits -
+ * the system does not boot. The JP6502 checks for its keyboard so.
+ *
  * If INIT_CLOCK is defined (with INIT_VERBOSE), init shows the time after
  * its first line, as YYYY-MM-DD HH:MM:SS. The ROM needs a clock driver
  * for it: clk_get, c=0 when clk_bcd holds seconds, minutes, hours,
@@ -208,6 +213,16 @@ n	dex
 	lda #10
 	jsr chrout
 none	.)
+#endif
+#ifdef INIT_CHECK
+	jsr INIT_CHECK		; c=1: start nothing, a/y say why
+	bcc checked
+	jsr strout
+#ifdef INIT_BELL
+	inc failcnt
+#endif
+	jmp endloop
+checked
 #endif
 #endif
 #ifdef INIT_RESTART
