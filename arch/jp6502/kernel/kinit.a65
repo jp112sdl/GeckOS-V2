@@ -124,6 +124,17 @@ pl	  sta (0),y
 	  .)
 
 /*
+ * A reset of the board clears the VIAs; a jump to the reset vector -
+ * "reset" in the shell - leaves them as they were, the keyboard
+ * interrupt of VIA3 on. The keyboard controller is only reset with the
+ * board, and kbd_check (devices/kbdchk_jp.a65) needs to know whether it
+ * will tell again if there is a keyboard.
+ */
+	  lda VIA3+VIA_IER
+	  and #%00000010
+	  sta kbdwarm
+
+/*
  * Keep every interrupt source quiet until its driver takes it over.
  */
 	  lda #$7f

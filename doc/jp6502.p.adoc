@@ -110,6 +110,13 @@ on the LCD and on the screen, there are three beeps, and nothing is
 started, not the shell on the serial line either. Plug the keyboard in
 and reset.
 
+"reset" in the shell only jumps to the reset vector: the VIAs keep their
+state and the controller is not reset, so it tells nothing. The kernel
+sees that from the keyboard interrupt of VIA3, which is still on, and
+init then takes what the controller sent last, which is still on port A:
+$fe means no keyboard, anything else - a status or a key - one. There is
+no waiting then.
+
 When everything is started, init sends a bell to the console: one short
 beep. When something could not be started - most likely the shell,
 because there is no card in the slot - there are three, and the reason

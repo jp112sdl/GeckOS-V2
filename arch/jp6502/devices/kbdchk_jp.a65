@@ -32,6 +32,8 @@
 
 	.bss
 kbdt	.byt 0		/* time left */
+&&kbdwarm .byt 0	/* set by kinit: the boot was a jump to the reset
+			   vector, not a reset of the board */
 	.text
 
 /*
@@ -41,11 +43,24 @@ kbdt	.byt 0		/* time left */
  * keeps it in kbdstat, and this waits up to about 5 s for it - as OS1
  * does. Port A itself says nothing before that: until the controller's
  * program runs, its lines float.
+ *
+ * "reset" in the shell only jumps to the reset vector, which leaves the
+ * controller running - it tells nothing then. But its program runs, so
+ * port A holds what it sent last, a status or a key: $fe means no
+ * keyboard, anything else one.
+ *
  * c=1 when there is none, or the controller does not tell: the message
  * is on the LCD then, and a/y point to it for init.
  */
 &&kbd_check .(
-	lda #7*CLOCK_MHZ
+	lda kbdwarm
+	beq cold
+	lda VIA3+VIA_DRBX	; port A without the handshake
+	cmp #KBD_DISCONNECTED
+	beq got
+	lda #KBD_CONNECTED
+	bne got
+cold	lda #7*CLOCK_MHZ
 	sta kbdt
 l	lda kbdstat		; set in the interrupt
 	bne got
