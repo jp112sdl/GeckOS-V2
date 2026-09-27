@@ -122,6 +122,7 @@ ROMSTART=*
 					   (devices/kbdchk_jp.a65) */
 #define	INIT_NOSTRERROR		/* a program that ends: its error code
 				   in hex, no text - saves 900 bytes */
+#define	INIT_QUIETRESTART	/* no "Prepared restart!" per shell */
 #include  "sysapps/init/init.a65"
 
 #echo after INIT
