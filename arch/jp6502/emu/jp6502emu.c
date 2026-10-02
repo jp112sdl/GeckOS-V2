@@ -440,11 +440,19 @@ static struct {
 	u64 frame_next;
 } vdp;
 
+static u16 pc;		/* the 65C02's, further down */
+
 static void vdp_check(void)
 {
 	if (opt_vdpcheck && vdp.last_access) {
 		double us = (cycles - vdp.last_access) / clock_mhz;
 		if (us < 8.0) {
+			/* the first few are worth a location */
+			if (vdp.violations < 8) {
+				int off; const char *l = label_for(pc, &off);
+				fprintf(stderr, "\nVDP access %.2f us after the last one, at PC %04X (%s+%d)\n",
+					us, pc, l ? l : "?", l ? off : 0);
+			}
 			vdp.violations++;
 		}
 	}
