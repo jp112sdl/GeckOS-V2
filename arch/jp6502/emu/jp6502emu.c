@@ -44,6 +44,11 @@
  *                   second after reset whether it found one, tells $fe
  *                   instead of $ff (port A floats until then)
  *     -n            no keyboard controller: it never tells
+ *     -A CMD        the other end of the ACIA is the program CMD (run by
+ *                   /bin/sh) instead of the terminal: what the 6502 sends
+ *                   goes to its standard input, what it writes to standard
+ *                   output arrives at the ACIA - for Software/tools/drivesim.py
+ *                   --stdio, the floppy drive of MS-BASIC's LOAD "NAME",8
  *     -x FILE       script, see below; without one the terminal is
  *                   connected to the ACIA (Ctrl-] quits)
  *     -t SECONDS    stop after this much emulated time
@@ -68,6 +73,7 @@
  *   sound                 print the SN76489 volumes and the speaker
  *   rtc                   print the time of the clock
  *   regs                  print the CPU registers
+ *   vpeek ADDR [N]        print N bytes of VRAM from ADDR (hex), 16 by default
  *   ilreset               restart the -I measurement and the overrun count
  *   jump ADDR [X]         continue at ADDR (hex), interrupts off, XR set
  *   quit                  stop
@@ -82,6 +88,7 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include <time.h>
+#include <signal.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -149,8 +156,19 @@ static size_t serout_len, serout_cap;
 static size_t serout_mark;	/* "until" searches from here */
 static int interactive;
 
+/* -A: a program at the other end of the ACIA */
+static int peer_in = -1, peer_out = -1;
+static u64 peer_next;
+
 static void serial_out(u8 c)
 {
+	if (peer_out >= 0) {
+		if (write(peer_out, &c, 1) != 1) {
+			close(peer_out);
+			peer_out = -1;
+		}
+		return;
+	}
 	if (serout_len + 1 >= serout_cap) {
 		serout_cap = serout_cap ? serout_cap * 2 : 65536;
 		serout = realloc(serout, serout_cap);
@@ -351,6 +369,40 @@ static void acia_queue(const u8 *s, size_t n)
 	acia.rxq = realloc(acia.rxq, acia.rxq_len + n + 1);
 	memcpy(acia.rxq + acia.rxq_len, s, n);
 	acia.rxq_len += n;
+}
+
+static void peer_start(const char *cmd)
+{
+	int to[2], from[2];
+	if (pipe(to) || pipe(from)) { perror("pipe"); exit(1); }
+	pid_t pid = fork();
+	if (pid < 0) { perror("fork"); exit(1); }
+	if (pid == 0) {
+		dup2(to[0], 0);
+		dup2(from[1], 1);
+		close(to[0]); close(to[1]); close(from[0]); close(from[1]);
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	close(to[0]);
+	close(from[1]);
+	peer_out = to[1];
+	peer_in = from[0];
+	fcntl(peer_in, F_SETFL, O_NONBLOCK);
+	signal(SIGPIPE, SIG_IGN);
+}
+
+/* what the program has written so far goes into the receive queue */
+static void peer_poll(void)
+{
+	u8 buf[256];
+	ssize_t n = read(peer_in, buf, sizeof buf);
+	if (n > 0) {
+		acia_queue(buf, n);
+	} else if (n == 0) {
+		close(peer_in);
+		peer_in = -1;
+	}
 }
 
 static void acia_tick(void)
@@ -1597,6 +1649,10 @@ static void run_cycles(u64 n)
 			}
 		}
 		via_tick(&via1, c); via_tick(&via2, c); via_tick(&via3, c);
+		if (peer_in >= 0 && cycles >= peer_next) {
+			peer_poll();
+			peer_next = cycles + 2000;
+		}
 		acia_tick();
 		vdp_tick();
 		kbd_tick();
@@ -1710,6 +1766,12 @@ static int run_script(FILE *sf, double tmax)
 			sscanf(arg, "%x %u", &a, &n);
 			for (unsigned i = 0; i < n; i++) printf("%s%02X", i % 16 ? " " : (i ? "\n" : ""), rd(a + i));
 			printf("\n");
+		} else if (!strcmp(line, "vpeek")) {
+			unsigned a, n = 16;
+			sscanf(arg, "%x %u", &a, &n);
+			for (unsigned i = 0; i < n; i++)
+				printf("%s%02X", i % 16 ? " " : (i ? "\n" : ""), vdp.vram[(a + i) & 0x3fff]);
+			printf("\n");
 		} else if (!strcmp(line, "jump")) {
 			unsigned a, x = X;
 			sscanf(arg, "%x %x", &a, &x);
@@ -1763,7 +1825,7 @@ int main(int argc, char **argv)
 	const char *script = NULL, *sdimg = NULL, *labfile = NULL, *rtctime = NULL;
 	double tmax = 0;
 	int o;
-	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:Sk:KRNn")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:x:t:l:TvrIPb:z:d:Sk:KRNnA:")) != -1) {
 		switch (o) {
 		case 'c': clock_mhz = atof(optarg); break;
 		case 's': sdimg = optarg; break;
@@ -1784,8 +1846,9 @@ int main(int argc, char **argv)
 		case 'R': rtc.present = 0; break;
 		case 'N': opt_nokbd = 1; break;
 		case 'n': opt_nokbc = 1; break;
+		case 'A': peer_start(optarg); break;
 		default:
-			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-k time] [-K] [-R] [-N] [-n] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
+			fprintf(stderr, "usage: %s [-c MHz] [-s sd.img] [-z N] [-d ms] [-S] [-k time] [-K] [-R] [-N] [-n] [-A cmd] [-x script] [-t secs] [-l labels] [-T] [-v] [-r] rom.bin\n", argv[0]);
 			return 1;
 		}
 	}

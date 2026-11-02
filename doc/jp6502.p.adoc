@@ -272,7 +272,9 @@ the baud rate whether the CPU keeps up or not and counts the overruns,
 The clock starts at the host's time, or at *-k "2026-09-26 14:30"*;
 *-K* gives a new one that never ran, *-R* none at all ("rtc" prints
 its time). *-N* has the keyboard controller report no keyboard, *-n*
-leaves the controller out.
+leaves the controller out. *-A CMD* puts a program at the other end of
+the ACIA - the floppy drive of the board's MS-BASIC,
+`Software/tools/drivesim.py --stdio`, for one.
 *emu/fat32img.py* makes FAT32 card images and lists, reads and checks
 them.
 
