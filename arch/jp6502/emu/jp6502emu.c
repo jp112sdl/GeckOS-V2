@@ -48,7 +48,8 @@
  *                   /bin/sh) instead of the terminal: what the 6502 sends
  *                   goes to its standard input, what it writes to standard
  *                   output arrives at the ACIA - for Software/tools/drivesim.py
- *                   --stdio, the floppy drive of MS-BASIC's LOAD "NAME",8
+ *                   --stdio, the floppy drive of MS-BASIC's LOAD "NAME",8;
+ *                   the emulator then runs in real time, as the program does
  *     -x FILE       script, see below; without one the terminal is
  *                   connected to the ACIA (Ctrl-] quits)
  *     -t SECONDS    stop after this much emulated time
@@ -159,6 +160,7 @@ static int interactive;
 /* -A: a program at the other end of the ACIA */
 static int peer_in = -1, peer_out = -1;
 static u64 peer_next;
+static double peer_t0;		/* the wall clock when it was started */
 
 static void serial_out(u8 c)
 {
@@ -371,6 +373,13 @@ static void acia_queue(const u8 *s, size_t n)
 	acia.rxq_len += n;
 }
 
+static double wallclock(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 static void peer_start(const char *cmd)
 {
 	int to[2], from[2];
@@ -390,6 +399,19 @@ static void peer_start(const char *cmd)
 	peer_in = from[0];
 	fcntl(peer_in, F_SETFL, O_NONBLOCK);
 	signal(SIGPIPE, SIG_IGN);
+	peer_t0 = wallclock();
+}
+
+/* The program runs in real time - it takes its milliseconds to answer, and
+ * keeps timeouts of its own - so while one is attached the emulator keeps
+ * pace with the wall clock. Left to race, it gets through an emulated second
+ * in a few milliseconds, and an answer that takes the program 20 ms arrives
+ * emulated seconds late, past the 6502's own timeouts. */
+static void peer_pace(void)
+{
+	double ahead = cycles / (clock_mhz * 1e6) - (wallclock() - peer_t0);
+	if (ahead > 0.001)
+		usleep((useconds_t)(ahead * 1e6));
 }
 
 /* what the program has written so far goes into the receive queue */
@@ -1651,6 +1673,7 @@ static void run_cycles(u64 n)
 		via_tick(&via1, c); via_tick(&via2, c); via_tick(&via3, c);
 		if (peer_in >= 0 && cycles >= peer_next) {
 			peer_poll();
+			peer_pace();
 			peer_next = cycles + 2000;
 		}
 		acia_tick();

@@ -274,7 +274,7 @@ The clock starts at the host's time, or at *-k "2026-09-26 14:30"*;
 its time). *-N* has the keyboard controller report no keyboard, *-n*
 leaves the controller out. *-A CMD* puts a program at the other end of
 the ACIA - the floppy drive of the board's MS-BASIC,
-`Software/tools/drivesim.py --stdio`, for one.
+`Software/tools/drivesim.py --stdio`, for one; it runs in real time then.
 *emu/fat32img.py* makes FAT32 card images and lists, reads and checks
 them.
 
